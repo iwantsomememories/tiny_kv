@@ -1,4 +1,4 @@
-# The TinyKV Course
+# Description
 
 This repository contains my implementation of [TinyKV](https://github.com/talent-plan/tinykv). The detailed course information is as follows:
 
