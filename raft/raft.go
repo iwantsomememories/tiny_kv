@@ -433,7 +433,12 @@ func stepLeader(r *Raft, m pb.Message) {
 	}
 	switch m.MsgType {
 	case pb.MessageType_MsgAppendResponse:
-		// todo(A)
+		if m.Reject {
+			DPrintf("Raft %x received msgApp rejection(lastindex: %d) from %x for index %d",
+				r.id, m.RejectHint, m.From, m.Index)
+		} else {
+
+		}
 	case pb.MessageType_MsgHeartbeatResponse:
 		if pr.Match < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
@@ -513,7 +518,17 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 
 	DPrintf("Raft %x received msgApp [logterm: %d, index: %d] from %x.\n", r.id, m.LogTerm, m.Index, m.From)
-	// todo
+	ents := make([]pb.Entry, 0, len(m.Entries))
+	for _, e := range m.Entries {
+		ents = append(ents, *e)
+	}
+	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, ents...); ok {
+		r.send(pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From, Index: mlastIndex})
+	} else {
+		DPrintf("Raft %x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x",
+			r.id, r.RaftLog.zeroTermOnErrCompacted(r.RaftLog.Term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
+		r.send(pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From, Index: m.Index, Reject: true, RejectHint: r.RaftLog.LastIndex()})
+	}
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -635,14 +650,12 @@ func (r *Raft) appendEntry(ents ...pb.Entry) {
 }
 
 func (r *Raft) maybeCommit() bool {
-	mis := make([]uint64, 0, len(r.Prs))
+	mis := make(uint64Slice, 0, len(r.Prs))
 	for _, pr := range r.Prs {
 		mis = append(mis, pr.Match)
 	}
 
-	sort.Slice(mis, func(i, j int) bool {
-		return i > j
-	})
+	sort.Sort(sort.Reverse(mis))
 
 	mci := mis[r.quorum()-1]
 	return r.RaftLog.maybeCommit(mci, r.Term)

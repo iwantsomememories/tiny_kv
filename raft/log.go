@@ -87,6 +87,28 @@ func newLog(storage Storage) *RaftLog {
 	return log
 }
 
+// maybeAppend returns (0, false) if the entries cannot be appended. Otherwise,
+// it returns (last index of new entries, true).
+func (l *RaftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry) (uint64, bool) {
+	if l.matchTerm(index, logTerm) {
+		lastnewi := ents[len(ents)-1].Index
+
+		ci := l.findConflict(ents)
+		switch {
+		case ci == 0:
+		case ci <= l.committed:
+			panic(fmt.Sprintf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed))
+		default:
+			offset := index + 1
+			l.append(ents[ci-offset:]...)
+		}
+		l.commitTo(min(lastnewi, committed))
+		return lastnewi, true
+	} else {
+		return 0, false
+	}
+}
+
 // We need to compact the log entries in some point of time like
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
@@ -328,4 +350,28 @@ func (l *RaftLog) zeroTermOnErrCompacted(term uint64, err error) uint64 {
 		return 0
 	}
 	panic(err)
+}
+
+func (l *RaftLog) matchTerm(index, term uint64) bool {
+	t, err := l.Term(index)
+	if err != nil {
+		return false
+	}
+
+	return t == term
+}
+
+func (l *RaftLog) findConflict(ents []pb.Entry) uint64 {
+	for _, en := range ents {
+		if !l.matchTerm(en.Index, en.Term) {
+			if en.Index < l.LastIndex() {
+				DPrintf("found conflict at index %d [existing term: %d, conflicting term: %d]",
+					en.Index, l.zeroTermOnErrCompacted(l.Term(en.Index)), en.Term)
+			}
+
+			return en.Index
+		}
+	}
+
+	return 0
 }
