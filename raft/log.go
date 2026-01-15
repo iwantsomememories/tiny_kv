@@ -91,7 +91,7 @@ func newLog(storage Storage) *RaftLog {
 // it returns (last index of new entries, true).
 func (l *RaftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry) (uint64, bool) {
 	if l.matchTerm(index, logTerm) {
-		lastnewi := ents[len(ents)-1].Index
+		lastnewi := index + uint64(len(ents))
 
 		ci := l.findConflict(ents)
 		switch {
@@ -206,9 +206,9 @@ func (l *RaftLog) LastTerm() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	err := l.checkOutOfBounds(i)
-	if err != nil {
-		return 0, err
+	dummyIndex := l.FirstIndex() - 1
+	if i < dummyIndex || i > l.LastIndex() {
+		return 0, nil
 	}
 
 	if i > l.stabled {
@@ -320,21 +320,6 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 	}
 
 	return ents, nil
-}
-
-func (l *RaftLog) checkOutOfBounds(i uint64) error {
-	fi := l.FirstIndex()
-	li := l.LastIndex()
-
-	if i < fi {
-		return ErrCompacted
-	}
-
-	if i > li {
-		return ErrExceedLastIndex
-	}
-
-	return nil
 }
 
 func (l *RaftLog) isUpToDate(index, term uint64) bool {

@@ -125,6 +125,17 @@ func (p *Progress) maybeUpdate(n uint64) bool {
 	return updated
 }
 
+func (p *Progress) maybeDecrto(rejected, last uint64) bool {
+	if rejected != p.Next-1 {
+		return false
+	}
+
+	if p.Next = min(rejected, last+1); p.Next < 1 {
+		p.Next = 1
+	}
+	return true
+}
+
 type Raft struct {
 	id uint64
 
@@ -388,22 +399,21 @@ func (r *Raft) Step(m pb.Message) error {
 				DPrintf("Raft %x cannot campaign at term %d since there are still %d pending configuration changes to apply.\n", r.id, r.Term, len(pcents))
 				return nil
 			}
-			DPrintf("Raft [%d] is starting a new election at term %d.\n", r.id, r.Term)
+			DPrintf("Raft %x is starting a new election at term %d.\n", r.id, r.Term)
 			r.campaign()
 		} else {
-			DPrintf("Raft [%d] ignoring MsgHup because already leader.\n", r.id)
+			DPrintf("Raft %x ignoring MsgHup because already leader.\n", r.id)
 		}
 	case pb.MessageType_MsgRequestVote:
 		if (r.Vote == None || r.Vote == m.From) && r.RaftLog.isUpToDate(m.Index, m.Term) {
 			DPrintf("Raft %x [logterm: %d, index: %d, vote: %x] cast %s for %x [logterm: %d, index: %d] at term %d",
 				r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
 
-			r.send(pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, To: m.From, Reject: false})
+			r.send(pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, To: m.From})
 			r.electionElapsed = 0
 			r.Vote = m.From
 		} else {
-			DPrintf("Raft %x [logterm: %d, index: %d, vote: %x] rejected %s for %x [logterm: %d, index: %d] at term %d",
-				r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
+			DPrintf("Raft %x [logterm: %d, index: %d, vote: %x] rejected %s for %x [logterm: %d, index: %d] at term %d", r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
 
 			r.send(pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, To: m.From, Reject: true})
 		}
@@ -423,6 +433,7 @@ func stepLeader(r *Raft, m pb.Message) {
 		return
 	case pb.MessageType_MsgPropose:
 		// todo
+
 		return
 	}
 
@@ -436,8 +447,22 @@ func stepLeader(r *Raft, m pb.Message) {
 		if m.Reject {
 			DPrintf("Raft %x received msgApp rejection(lastindex: %d) from %x for index %d",
 				r.id, m.RejectHint, m.From, m.Index)
+			if pr.maybeDecrto(m.Index, m.RejectHint) {
+				DPrintf("Raft %x decreased progress of %x to [%+v].\n", r.id, m.From, pr)
+				// try to send append again.
+				r.sendAppend(m.From)
+			}
 		} else {
+			if pr.maybeUpdate(m.Index) {
+				if r.maybeCommit() {
+					// if commit, then broadcast AppendEntries
+					r.bcastAppend()
+				}
 
+				if m.From == r.leadTransferee && pr.Match == r.RaftLog.LastIndex() {
+					// todo
+				}
+			}
 		}
 	case pb.MessageType_MsgHeartbeatResponse:
 		if pr.Match < r.RaftLog.LastIndex() {
@@ -541,63 +566,6 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
-}
-
-func (r *Raft) handleRequestVote(m pb.Message) {
-	if m.MsgType != pb.MessageType_MsgRequestVote || m.To != r.id {
-		DPrintf("Raft [%d]: warning -- wrong MsgType(%v) or To(%d) for handleRequestVote!\n", r.id, m.MsgType, m.To)
-		return
-	}
-	response := pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, From: r.id, To: m.From, Reject: true}
-	response.MsgType = pb.MessageType_MsgRequestVoteResponse
-	defer func() {
-		r.msgs = append(r.msgs, response)
-	}()
-
-	if r.Term < m.Term {
-		r.Term = m.Term
-		r.State = StateFollower
-		r.Vote = None
-	}
-
-	response.Term = r.Term
-	if r.Term > m.Term {
-		return
-	}
-
-	myLastLogIndex := r.RaftLog.LastIndex()
-	myLastLogTerm, _ := r.RaftLog.Term(myLastLogIndex)
-
-	upToDate := m.LogTerm > myLastLogTerm || (m.LogTerm == myLastLogTerm && m.Index >= myLastLogIndex)
-	haveVotedOthers := r.Vote != None && r.Vote != m.From
-
-	if upToDate && !haveVotedOthers {
-		r.Vote = m.From
-		r.electionElapsed = 0
-		response.Reject = false
-		DPrintf("Raft [%d] granting vote for %d at term %d.\n", r.id, m.From, m.Term)
-	}
-}
-
-func (r *Raft) handleRequestVoteResponse(m pb.Message) {
-	if m.MsgType != pb.MessageType_MsgRequestVoteResponse || m.To != r.id {
-		DPrintf("Raft [%d]: warning -- wrong MsgType(%v) or To(%d) for handleRequestVoteResponse!\n", r.id, m.MsgType, m.To)
-		return
-	}
-
-	if m.Term > r.Term {
-		r.becomeFollower(m.Term, None)
-		return
-	}
-
-	if r.State != StateCandidate || m.Reject || r.Term > m.Term {
-		return
-	}
-
-	r.votes[m.From] = true
-	if len(r.votes)*2 > len(r.Prs) {
-		r.becomeLeader()
-	}
 }
 
 // addNode add a new node to raft group
@@ -725,8 +693,8 @@ func (r *Raft) reset(term uint64) {
 	r.abortLeaderTransfer()
 
 	r.votes = make(map[uint64]bool)
-	for p, _ := range r.Prs {
-		r.Prs[p] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
+	for id := range r.Prs {
+		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1, Match: 0}
 	}
 }
 
