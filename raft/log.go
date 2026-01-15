@@ -318,7 +318,7 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 	}
 
 	if hi > l.stabled+1 {
-		unstableEnts := l.entries[max(lo-l.stabled-1, 0) : hi-l.stabled-1]
+		unstableEnts := l.entries[max(lo, l.stabled+1)-l.stabled-1 : hi-l.stabled-1]
 		if len(ents) > 0 {
 			ents = append(ents, unstableEnts...)
 		} else {

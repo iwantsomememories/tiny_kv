@@ -431,8 +431,34 @@ func stepLeader(r *Raft, m pb.Message) {
 		r.bcastHeartbeat()
 		return
 	case pb.MessageType_MsgPropose:
-		// todo
+		if len(m.Entries) == 0 {
+			panic(fmt.Sprintf("Raft %x stepped empty MsgProp", r.id))
+		}
 
+		if _, exist := r.Prs[r.id]; !exist {
+			return
+		}
+
+		if r.leadTransferee != None {
+			DPrintf("Raft %x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
+			return
+		}
+
+		ents := []pb.Entry{}
+		for _, e := range m.Entries {
+			if e.EntryType == pb.EntryType_EntryConfChange {
+				if r.PendingConfIndex != 0 {
+					DPrintf("propose conf %s ignored since pending unapplied configuration", e.String())
+					e.EntryType = pb.EntryType_EntryNormal
+				} else {
+					r.PendingConfIndex = e.Index
+				}
+			}
+			ents = append(ents, pb.Entry{Index: e.Index, Term: e.Term, EntryType: e.EntryType, Data: e.Data})
+		}
+
+		r.appendEntry(ents...)
+		r.bcastAppend()
 		return
 	}
 
