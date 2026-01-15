@@ -189,8 +189,6 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
-
-	step stepFunc
 }
 
 // newRaft return a raft peer with the given config
@@ -275,7 +273,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		if len(entries) > 0 {
 			var ents []*pb.Entry
 			for _, entry := range entries {
-				ents = append(ents, &entry)
+				ents = append(ents, &pb.Entry{EntryType: entry.EntryType, Term: entry.Term, Index: entry.Index, Data: entry.Data})
 			}
 			m.Entries = ents
 		}
@@ -298,7 +296,7 @@ func (r *Raft) bcastAppend() {
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
 	commit := min(r.RaftLog.committed, r.Prs[to].Match)
-	r.send(pb.Message{To: r.id, MsgType: pb.MessageType_MsgHeartbeat, Commit: commit})
+	r.send(pb.Message{To: to, MsgType: pb.MessageType_MsgHeartbeat, Commit: commit})
 }
 
 func (r *Raft) bcastHeartbeat() {
@@ -327,7 +325,6 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
 	r.reset(term)
 	r.State = StateFollower
-	r.step = stepFollower
 	r.Lead = lead
 
 	DPrintf("Raft %x became follower at term %d.\n", r.id, r.Term)
@@ -338,9 +335,7 @@ func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	r.reset(r.Term + 1)
 	r.State = StateCandidate
-	r.step = stepCandidate
 	r.Vote = r.id
-	r.votes[r.id] = true
 
 	DPrintf("Raft %x became candidate at term %d.\n", r.id, r.Term)
 }
@@ -351,7 +346,6 @@ func (r *Raft) becomeLeader() {
 	// NOTE: Leader should propose a noop entry on its term
 	r.reset(r.Term)
 	r.State = StateLeader
-	r.step = stepLeader
 	r.Lead = r.id
 
 	ents, err := r.RaftLog.entriesAfter(r.RaftLog.committed + 1)
@@ -375,7 +369,7 @@ func (r *Raft) becomeLeader() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	DPrintf("Raft %x receive Msg{From: %x, Type: %s} at Term %d as %s.\n", r.id, m.From, m.MsgType.String(), r.Term, r.State)
+	DPrintf("Raft %x received Msg{From: %x, Type: %s} at Term %d as %s.\n", r.id, m.From, m.MsgType.String(), r.Term, r.State)
 
 	switch {
 	case m.Term == 0:
@@ -386,7 +380,7 @@ func (r *Raft) Step(m pb.Message) error {
 			// todo
 			lead = None
 		}
-		r.becomeFollower(r.Term, lead)
+		r.becomeFollower(m.Term, lead)
 	case m.Term < r.Term:
 		return nil
 	}
@@ -395,8 +389,8 @@ func (r *Raft) Step(m pb.Message) error {
 	case pb.MessageType_MsgHup:
 		if r.State != StateLeader {
 			ents := r.RaftLog.nextEnts()
-			if pcents := pendingConfChangeEntries(ents); len(pcents) != 0 {
-				DPrintf("Raft %x cannot campaign at term %d since there are still %d pending configuration changes to apply.\n", r.id, r.Term, len(pcents))
+			if pents := pendingConfChangeEntries(ents); len(pents) != 0 {
+				DPrintf("Raft %x cannot campaign at term %d since there are still %d pending configuration changes to apply.\n", r.id, r.Term, len(pents))
 				return nil
 			}
 			DPrintf("Raft %x is starting a new election at term %d.\n", r.id, r.Term)
@@ -418,13 +412,18 @@ func (r *Raft) Step(m pb.Message) error {
 			r.send(pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, To: m.From, Reject: true})
 		}
 	default:
-		r.step(r, m)
+		switch r.State {
+		case StateFollower:
+			stepFollower(r, m)
+		case StateCandidate:
+			stepCandidate(r, m)
+		case StateLeader:
+			stepLeader(r, m)
+		}
 	}
 
 	return nil
 }
-
-type stepFunc func(r *Raft, m pb.Message)
 
 func stepLeader(r *Raft, m pb.Message) {
 	switch m.MsgType {
@@ -488,7 +487,7 @@ func stepCandidate(r *Raft, m pb.Message) {
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgRequestVoteResponse:
 		gr := r.poll(m.From, m.MsgType, !m.Reject)
-		DPrintf("%x [quorum:%d] has received %d %s votes and %d vote rejections", r.id, r.quorum(), gr, m.MsgType, len(r.votes)-gr)
+		DPrintf("Raft %x [quorum:%d] has received %d %s votes and %d vote rejections", r.id, r.quorum(), gr, m.MsgType, len(r.votes)-gr)
 		switch r.quorum() {
 		case gr:
 			r.becomeLeader()
@@ -542,15 +541,15 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		return
 	}
 
-	DPrintf("Raft %x received msgApp [logterm: %d, index: %d] from %x.\n", r.id, m.LogTerm, m.Index, m.From)
+	DPrintf("Raft %x received msgApp [logterm: %d, index: %d, entries: %+v] from %x.\n", r.id, m.LogTerm, m.Index, m.Entries, m.From)
 	ents := make([]pb.Entry, 0, len(m.Entries))
 	for _, e := range m.Entries {
-		ents = append(ents, *e)
+		ents = append(ents, pb.Entry{EntryType: e.EntryType, Term: e.Term, Index: e.Index, Data: e.Data})
 	}
 	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, ents...); ok {
 		r.send(pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From, Index: mlastIndex})
 	} else {
-		DPrintf("Raft %x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x",
+		DPrintf("Raft %x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x.\n",
 			r.id, r.RaftLog.zeroTermOnErrCompacted(r.RaftLog.Term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
 		r.send(pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From, Index: m.Index, Reject: true, RejectHint: r.RaftLog.LastIndex()})
 	}
@@ -580,9 +579,9 @@ func (r *Raft) removeNode(id uint64) {
 
 func (r *Raft) tickElection() {
 	r.electionElapsed++
-	if r.promotable() && r.electionElapsed >= r.electionTimeout {
+	if r.promotable() && r.pastElectionTimeout() {
 		r.electionElapsed = 0
-		r.send(pb.Message{MsgType: pb.MessageType_MsgHup})
+		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHup})
 	}
 }
 
@@ -602,7 +601,7 @@ func (r *Raft) tickHeartbeat() {
 	}
 
 	r.heartbeatElapsed = 0
-	r.send(pb.Message{MsgType: pb.MessageType_MsgBeat})
+	r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgBeat})
 }
 
 func (r *Raft) appendEntry(ents ...pb.Entry) {
@@ -613,6 +612,7 @@ func (r *Raft) appendEntry(ents ...pb.Entry) {
 	}
 
 	r.RaftLog.append(ents...)
+	DPrintf("Raft %x append new ents{%+v} in its log{%s}.\n", r.id, ents, ltoa(r.RaftLog))
 	r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
 	r.maybeCommit()
 }
@@ -630,9 +630,9 @@ func (r *Raft) maybeCommit() bool {
 }
 
 func (r *Raft) campaign() {
+	r.becomeCandidate()
 	term := r.Term
 	msgType := pb.MessageType_MsgRequestVote
-	r.becomeCandidate()
 
 	if r.quorum() == r.poll(r.id, pb.MessageType_MsgRequestVoteResponse, true) {
 		r.becomeLeader()
@@ -647,7 +647,7 @@ func (r *Raft) campaign() {
 		DPrintf("Raft %x [logterm: %d, index: %d] sent %s request to %x at term %d",
 			r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), msgType.String(), id, r.Term)
 
-		msg := pb.Message{MsgType: pb.MessageType_MsgRequestVote, To: id, Term: term, LogTerm: r.RaftLog.LastTerm(), Index: r.RaftLog.LastIndex()}
+		msg := pb.Message{MsgType: msgType, To: id, Term: term, LogTerm: r.RaftLog.LastTerm(), Index: r.RaftLog.LastIndex()}
 		r.send(msg)
 	}
 }
@@ -713,9 +713,9 @@ func (r *Raft) promotable() bool {
 
 func (r *Raft) poll(id uint64, t pb.MessageType, v bool) (granted int) {
 	if v {
-		DPrintf("%x received %s from %x at term %d", r.id, t, id, r.Term)
+		DPrintf("Raft %x received %s from %x at term %d", r.id, t, id, r.Term)
 	} else {
-		DPrintf("%x received %s rejection from %x at term %d", r.id, t, id, r.Term)
+		DPrintf("Raft %x received %s rejection from %x at term %d", r.id, t, id, r.Term)
 	}
 
 	if _, exist := r.votes[id]; !exist {
@@ -731,10 +731,14 @@ func (r *Raft) poll(id uint64, t pb.MessageType, v bool) (granted int) {
 	return
 }
 
-func pendingConfChangeEntries(ents []pb.Entry) (entries []pb.Entry) {
+func (r *Raft) pastElectionTimeout() bool {
+	return r.electionElapsed >= r.randomizedElectionTimeout
+}
+
+func pendingConfChangeEntries(ents []pb.Entry) (pents []pb.Entry) {
 	for i := range ents {
 		if ents[i].EntryType == pb.EntryType_EntryConfChange {
-			entries = append(entries, ents[i])
+			pents = append(pents, ents[i])
 		}
 	}
 	return

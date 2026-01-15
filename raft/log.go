@@ -69,6 +69,11 @@ func newLog(storage Storage) *RaftLog {
 
 	log := &RaftLog{storage: storage}
 
+	firstIndex, err := storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+
 	lastIndex, err := storage.LastIndex()
 	if err != nil {
 		panic(err)
@@ -76,13 +81,8 @@ func newLog(storage Storage) *RaftLog {
 
 	log.stabled = lastIndex
 
-	snapshot, err := storage.Snapshot()
-	if err != nil {
-		panic(err)
-	}
-
-	log.committed = snapshot.GetMetadata().Index
-	log.applied = snapshot.GetMetadata().Index
+	log.committed = firstIndex - 1
+	log.applied = firstIndex - 1
 
 	return log
 }
@@ -131,7 +131,7 @@ func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
 	ents, err := l.slice(l.FirstIndex(), l.LastIndex()+1)
 	if err == nil {
-		if ents[0].Term == 0 && ents[0].Data == nil {
+		if ents[0].Term == 0 && ents[0].Data == nil { // remove dummy entries
 			ents = ents[1:]
 		}
 		return ents
@@ -240,18 +240,21 @@ func (l *RaftLog) append(ents ...pb.Entry) uint64 {
 }
 
 func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
-	offset := ents[0].Index
+	after := ents[0].Index
+	nextIndex := l.stabled + uint64(len(l.entries)+1)
 
-	if offset == l.entries[len(l.entries)-1].Index {
+	if after == nextIndex {
 		l.entries = append(l.entries, ents...)
-	} else if offset <= l.stabled+1 {
-		DPrintf("replace the unstable entries from index %d", offset)
+	} else if after <= l.stabled+1 {
+		DPrintf("replace the unstable entries from index %d", after)
 		l.entries = ents
-		l.stabled = offset - 1
-	} else {
-		DPrintf("truncate the unstable entries before index %d", offset)
-		l.entries = append([]pb.Entry{}, l.entries[:offset]...)
+		l.stabled = after - 1
+	} else if after <= nextIndex {
+		DPrintf("truncate the unstable entries before index %d", after)
+		l.entries = append([]pb.Entry{}, l.entries[:after-l.stabled-1]...)
 		l.entries = append(l.entries, ents...)
+	} else {
+		DPrintf("warning -- append Entries(after=%x) when nextIndex=%x", after, nextIndex)
 	}
 }
 
@@ -277,6 +280,10 @@ func (l *RaftLog) commitTo(tocommit uint64) {
 }
 
 func (l *RaftLog) entriesAfter(start uint64) ([]pb.Entry, error) {
+	if start > l.LastIndex() {
+		return []pb.Entry{}, nil
+	}
+
 	return l.slice(start, l.LastIndex()+1)
 }
 
