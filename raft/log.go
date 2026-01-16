@@ -57,6 +57,8 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	// the index of the first entry, i.e., the index of the dummy entry.
+	offset uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -67,20 +69,36 @@ func newLog(storage Storage) *RaftLog {
 		panic("storage must not be nil.")
 	}
 
-	log := &RaftLog{storage: storage}
-
 	firstIndex, err := storage.FirstIndex()
 	if err != nil {
 		panic(err)
 	}
+
+	// start with dummy entry
+	log := &RaftLog{storage: storage, entries: make([]pb.Entry, 1)}
+	log.entries[0].Index = firstIndex - 1
+	dummyTerm, err := storage.Term(firstIndex - 1)
+	if err != nil {
+		panic(err)
+	}
+	log.entries[0].Term = dummyTerm
+	log.offset = log.entries[0].Index
 
 	lastIndex, err := storage.LastIndex()
 	if err != nil {
 		panic(err)
 	}
 
-	log.stabled = lastIndex
+	stableEntries, err := storage.Entries(firstIndex, lastIndex+1)
+	if err != nil {
+		panic(err)
+	}
 
+	for _, ent := range stableEntries {
+		log.entries = append(log.entries, ent)
+	}
+
+	log.stabled = lastIndex
 	log.committed = firstIndex - 1
 	log.applied = firstIndex - 1
 
@@ -117,7 +135,7 @@ func (l *RaftLog) maybeCompact() {
 }
 
 func (l *RaftLog) maybeCommit(maxIndex, term uint64) bool {
-	if maxIndex > l.committed && l.zeroTermOnErrCompacted(l.Term(maxIndex)) == term {
+	if maxIndex > l.committed && l.zeroTermOnErr(l.Term(maxIndex)) == term {
 		l.commitTo(maxIndex)
 		return true
 	}
@@ -129,34 +147,28 @@ func (l *RaftLog) maybeCommit(maxIndex, term uint64) bool {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	ents, err := l.slice(l.FirstIndex(), l.LastIndex()+1)
-	if err == nil {
-		if ents[0].Term == 0 && ents[0].Data == nil { // remove dummy entries
-			ents = ents[1:]
-		}
-		return ents
+	if len(l.entries) == 1 { // only contain dummy entry
+		return make([]pb.Entry, 0)
 	}
 
-	if err == ErrCompacted { // try again if there was a racing compaction
-		return l.allEntries()
-	}
-	panic(err)
+	return l.entries[1:]
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	if len(l.entries) == 0 {
-		return nil
+	if l.stabled == l.LastIndex() {
+		return []pb.Entry{}
 	}
-	return l.entries
+
+	return l.entries[l.stabled-l.offset+1:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	if l.committed == l.applied {
-		return nil
+		return make([]pb.Entry, 0)
 	}
 
 	entries, err := l.slice(l.applied+1, l.committed+1)
@@ -171,27 +183,13 @@ func (l *RaftLog) FirstIndex() uint64 {
 		return l.pendingSnapshot.Metadata.Index + 1
 	}
 
-	index, err := l.storage.FirstIndex()
-	if err != nil {
-		panic(err)
-	}
-
-	return index
+	return l.offset + 1
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	if len(l.entries) != 0 {
-		return l.entries[len(l.entries)-1].Index
-	}
-
-	lastIndex, err := l.storage.LastIndex()
-	if err != nil {
-		panic(err)
-	}
-
-	return lastIndex
+	return l.offset + uint64(len(l.entries)) - 1
 }
 
 func (l *RaftLog) LastTerm() uint64 {
@@ -207,23 +205,15 @@ func (l *RaftLog) LastTerm() uint64 {
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	dummyIndex := l.FirstIndex() - 1
-	if i < dummyIndex || i > l.LastIndex() {
-		return 0, nil
+	if i < dummyIndex {
+		return 0, ErrCompacted
 	}
 
-	if i > l.stabled {
-		return l.entries[i-l.stabled-1].Term, nil
+	if i > l.LastIndex() {
+		return 0, ErrUnavailable
 	}
 
-	t, err := l.storage.Term(i)
-	if err == nil {
-		return t, nil
-	}
-
-	if err == ErrCompacted || err == ErrUnavailable {
-		return 0, err
-	}
-	panic(err)
+	return l.entries[i-l.offset].Term, nil
 }
 
 func (l *RaftLog) append(ents ...pb.Entry) uint64 {
@@ -231,8 +221,8 @@ func (l *RaftLog) append(ents ...pb.Entry) uint64 {
 		return l.LastIndex()
 	}
 
-	if offset := ents[0].Index; offset <= l.committed {
-		panic(fmt.Sprintf("offset(%d) is less than or equal to [committed(%d)]", offset, l.committed))
+	if after := ents[0].Index; after <= l.committed {
+		panic(fmt.Sprintf("after(%d) is less than or equal to [committed(%d)]", after, l.committed))
 	}
 
 	l.truncateAndAppend(ents)
@@ -241,28 +231,28 @@ func (l *RaftLog) append(ents ...pb.Entry) uint64 {
 
 func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
 	after := ents[0].Index
-	nextIndex := l.stabled + uint64(len(l.entries)+1)
+	firstIndex := l.FirstIndex()
+	if after < firstIndex {
+		panic(fmt.Sprintf("truncateAndAppend(after=%x) when firstIndex=%x", after, firstIndex))
+	}
 
+	nextIndex := l.LastIndex() + 1
 	if after == nextIndex {
 		l.entries = append(l.entries, ents...)
-	} else if after <= l.stabled+1 {
-		DPrintf("replace the unstable entries from index %d", after)
-		l.entries = ents
-		l.stabled = after - 1
-	} else if after <= nextIndex {
-		DPrintf("truncate the unstable entries before index %d", after)
-		l.entries = append([]pb.Entry{}, l.entries[:after-l.stabled-1]...)
+	} else if after < nextIndex {
+		DPrintf("truncate the entries before index %x", after)
+		l.entries = append([]pb.Entry{}, l.entries[:after-l.offset]...)
 		l.entries = append(l.entries, ents...)
+
+		if after <= l.stabled {
+			l.stabled = after - 1
+		}
 	} else {
-		DPrintf("warning -- append Entries(after=%x) when nextIndex=%x", after, nextIndex)
+		panic(fmt.Sprintf("truncateAndAppend(after=%x) when nextIndex=%x", after, nextIndex))
 	}
 }
 
 func (l *RaftLog) appliedTo(i uint64) {
-	if i == 0 {
-		return
-	}
-
 	if i > l.committed || i < l.applied {
 		panic(fmt.Sprintf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed))
 	}
@@ -281,7 +271,7 @@ func (l *RaftLog) commitTo(tocommit uint64) {
 
 func (l *RaftLog) entriesAfter(start uint64) ([]pb.Entry, error) {
 	if start > l.LastIndex() {
-		return []pb.Entry{}, nil
+		return []pb.Entry{}, ErrUnavailable
 	}
 
 	return l.slice(start, l.LastIndex()+1)
@@ -300,48 +290,26 @@ func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
 	}
 
 	if hi > li+1 {
-		return nil, ErrExceedLastIndex
+		return nil, ErrUnavailable
 	}
 
-	var ents []pb.Entry
-	if lo <= l.stabled {
-		storedEnts, err := l.storage.Entries(lo, min(hi, l.stabled+1))
-		if err == ErrCompacted {
-			return nil, err
-		} else if err == ErrUnavailable {
-			panic(fmt.Sprintf("entries[%d:%d) is unavailable from storage", lo, min(hi, l.stabled+1)))
-		} else if err != nil {
-			panic(err)
-		}
-
-		ents = storedEnts
+	if lo == hi {
+		return make([]pb.Entry, 0), nil
 	}
 
-	if hi > l.stabled+1 {
-		unstableEnts := l.entries[max(lo, l.stabled+1)-l.stabled-1 : hi-l.stabled-1]
-		if len(ents) > 0 {
-			ents = append(ents, unstableEnts...)
-		} else {
-			ents = unstableEnts
-		}
-	}
-
-	return ents, nil
+	return l.entries[lo-l.offset : hi-l.offset], nil
 }
 
 func (l *RaftLog) isUpToDate(index, term uint64) bool {
 	return term > l.LastTerm() || (term == l.LastTerm() && index >= l.LastIndex())
 }
 
-func (l *RaftLog) zeroTermOnErrCompacted(term uint64, err error) uint64 {
+func (l *RaftLog) zeroTermOnErr(term uint64, err error) uint64 {
 	if err == nil {
 		return term
 	}
 
-	if err == ErrCompacted {
-		return 0
-	}
-	panic(err)
+	return 0
 }
 
 func (l *RaftLog) matchTerm(index, term uint64) bool {
@@ -358,7 +326,7 @@ func (l *RaftLog) findConflict(ents []pb.Entry) uint64 {
 		if !l.matchTerm(en.Index, en.Term) {
 			if en.Index < l.LastIndex() {
 				DPrintf("found conflict at index %d [existing term: %d, conflicting term: %d]",
-					en.Index, l.zeroTermOnErrCompacted(l.Term(en.Index)), en.Term)
+					en.Index, l.zeroTermOnErr(l.Term(en.Index)), en.Term)
 			}
 
 			return en.Index
@@ -366,4 +334,17 @@ func (l *RaftLog) findConflict(ents []pb.Entry) uint64 {
 	}
 
 	return 0
+}
+
+func (l *RaftLog) uncommittedEnts() ([]pb.Entry, error) {
+	if l.committed < l.LastIndex() {
+		ents, err := l.entriesAfter(l.committed + 1)
+		if err != nil {
+			return make([]pb.Entry, 0), err
+		}
+
+		return ents, nil
+	} else {
+		return make([]pb.Entry, 0), nil
+	}
 }

@@ -126,7 +126,7 @@ func (p *Progress) maybeUpdate(n uint64) bool {
 }
 
 func (p *Progress) maybeDecrto(rejected, last uint64) bool {
-	if rejected != p.Next-1 {
+	if rejected != p.Next-1 { // outdated response
 		return false
 	}
 
@@ -259,14 +259,15 @@ func (r *Raft) sendAppend(to uint64) bool {
 	pr := r.Prs[to]
 	m := pb.Message{}
 	m.To = to
+	m.MsgType = pb.MessageType_MsgAppend
 
 	term, errt := r.RaftLog.Term(pr.Next - 1)
 	entries, erre := r.RaftLog.entriesAfter(pr.Next)
 
-	if errt != nil || erre != nil {
+	if errt != nil || (erre != nil && erre != ErrUnavailable) {
 		// todo
+
 	} else {
-		m.MsgType = pb.MessageType_MsgAppend
 		m.Index = pr.Next - 1
 		m.LogTerm = term
 		m.Commit = r.RaftLog.committed
@@ -348,7 +349,7 @@ func (r *Raft) becomeLeader() {
 	r.State = StateLeader
 	r.Lead = r.id
 
-	ents, err := r.RaftLog.entriesAfter(r.RaftLog.committed + 1)
+	ents, err := r.RaftLog.uncommittedEnts()
 	if err != nil {
 		panic(fmt.Sprintf("unexpected error getting uncommitted entries (%v)", err))
 	}
@@ -399,7 +400,7 @@ func (r *Raft) Step(m pb.Message) error {
 			DPrintf("Raft %x ignoring MsgHup because already leader.\n", r.id)
 		}
 	case pb.MessageType_MsgRequestVote:
-		if (r.Vote == None || r.Vote == m.From) && r.RaftLog.isUpToDate(m.Index, m.Term) {
+		if (r.Vote == None || r.Vote == m.From) && r.RaftLog.isUpToDate(m.Index, m.LogTerm) {
 			DPrintf("Raft %x [logterm: %d, index: %d, vote: %x] cast %s for %x [logterm: %d, index: %d] at term %d",
 				r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
 
@@ -414,39 +415,40 @@ func (r *Raft) Step(m pb.Message) error {
 	default:
 		switch r.State {
 		case StateFollower:
-			stepFollower(r, m)
+			return stepFollower(r, m)
 		case StateCandidate:
-			stepCandidate(r, m)
+			return stepCandidate(r, m)
 		case StateLeader:
-			stepLeader(r, m)
+			return stepLeader(r, m)
 		}
 	}
 
 	return nil
 }
 
-func stepLeader(r *Raft, m pb.Message) {
+func stepLeader(r *Raft, m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
 		r.bcastHeartbeat()
-		return
+		return nil
 	case pb.MessageType_MsgPropose:
 		if len(m.Entries) == 0 {
-			panic(fmt.Sprintf("Raft %x stepped empty MsgProp", r.id))
+			return ErrProposalDropped
 		}
 
 		if _, exist := r.Prs[r.id]; !exist {
-			return
+			return ErrProposalDropped
 		}
 
 		if r.leadTransferee != None {
 			DPrintf("Raft %x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
-			return
+			return ErrProposalDropped
 		}
 
 		ents := []pb.Entry{}
 		for _, e := range m.Entries {
 			if e.EntryType == pb.EntryType_EntryConfChange {
+				// todo
 				if r.PendingConfIndex != 0 {
 					DPrintf("propose conf %s ignored since pending unapplied configuration", e.String())
 					e.EntryType = pb.EntryType_EntryNormal
@@ -459,13 +461,13 @@ func stepLeader(r *Raft, m pb.Message) {
 
 		r.appendEntry(ents...)
 		r.bcastAppend()
-		return
+		return nil
 	}
 
 	pr, exist := r.Prs[m.From]
 	if !exist {
 		DPrintf("Raft %x no progress available for %x.\n", r.id, m.From)
-		return
+		return nil
 	}
 	switch m.MsgType {
 	case pb.MessageType_MsgAppendResponse:
@@ -496,9 +498,11 @@ func stepLeader(r *Raft, m pb.Message) {
 	case pb.MessageType_MsgTransferLeader:
 		// todo
 	}
+
+	return nil
 }
 
-func stepCandidate(r *Raft, m pb.Message) {
+func stepCandidate(r *Raft, m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgPropose:
 		DPrintf("Raft %x no leader at term %d; dropping proposal", r.id, r.Term)
@@ -524,14 +528,16 @@ func stepCandidate(r *Raft, m pb.Message) {
 	case pb.MessageType_MsgTimeoutNow:
 		DPrintf("Raft %x [term %d state %v] ignored MsgTimeoutNow from %x", r.id, r.Term, r.State, m.From)
 	}
+
+	return nil
 }
 
-func stepFollower(r *Raft, m pb.Message) {
+func stepFollower(r *Raft, m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgPropose:
 		if r.Lead == None {
 			DPrintf("Raft %x no leader at term %d; dropping proposal", r.id, r.Term)
-			return
+			return ErrProposalDropped
 		}
 		m.To = r.Lead
 		r.send(m)
@@ -552,11 +558,13 @@ func stepFollower(r *Raft, m pb.Message) {
 	case pb.MessageType_MsgTransferLeader:
 		if r.Lead == None {
 			DPrintf("%x no leader at term %d; dropping leader transfer msg", r.id, r.Term)
-			return
+			return ErrProposalDropped
 		}
 		m.To = r.Lead
 		r.send(m)
 	}
+
+	return nil
 }
 
 // handleAppendEntries handle AppendEntries RPC request
@@ -576,7 +584,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		r.send(pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From, Index: mlastIndex})
 	} else {
 		DPrintf("Raft %x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x.\n",
-			r.id, r.RaftLog.zeroTermOnErrCompacted(r.RaftLog.Term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
+			r.id, r.RaftLog.zeroTermOnErr(r.RaftLog.Term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
 		r.send(pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From, Index: m.Index, Reject: true, RejectHint: r.RaftLog.LastIndex()})
 	}
 }
