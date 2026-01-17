@@ -158,7 +158,7 @@ func (l *RaftLog) allEntries() []pb.Entry {
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	if l.stabled == l.LastIndex() {
-		return []pb.Entry{}
+		return make([]pb.Entry, 0)
 	}
 
 	return l.entries[l.stabled-l.offset+1:]
@@ -252,11 +252,11 @@ func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
 	}
 }
 
-func (l *RaftLog) appliedTo(i uint64) {
-	if i > l.committed || i < l.applied {
-		panic(fmt.Sprintf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed))
+func (l *RaftLog) appliedTo(toapply uint64) {
+	if toapply > l.committed || toapply < l.applied {
+		panic(fmt.Sprintf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", toapply, l.applied, l.committed))
 	}
-	l.applied = i
+	l.applied = toapply
 }
 
 func (l *RaftLog) commitTo(tocommit uint64) {
@@ -266,6 +266,23 @@ func (l *RaftLog) commitTo(tocommit uint64) {
 		}
 		l.committed = tocommit
 		DPrintf("commit to %d", tocommit)
+	}
+}
+
+func (l *RaftLog) stableTo(tostable, term uint64) {
+	gt, err := l.Term(tostable)
+	if err != nil {
+		return
+	}
+
+	if gt == term && tostable >= l.stabled {
+		l.stabled = tostable
+	}
+}
+
+func (l *RaftLog) stableSnapTo(index uint64) {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == index {
+		l.pendingSnapshot = nil
 	}
 }
 

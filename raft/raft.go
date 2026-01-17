@@ -219,7 +219,6 @@ func newRaft(c *Config) *Raft {
 		Prs:              make(map[uint64]*Progress),
 		State:            StateFollower,
 		votes:            make(map[uint64]bool),
-		msgs:             make([]pb.Message, 0),
 		Lead:             None,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
@@ -251,6 +250,12 @@ func newRaft(c *Config) *Raft {
 }
 
 func (r *Raft) quorum() int { return len(r.Prs)/2 + 1 }
+
+func (r *Raft) softState() *SoftState { return &SoftState{Lead: r.Lead, RaftState: r.State} }
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{Term: r.Term, Vote: r.Vote, Commit: r.RaftLog.committed}
+}
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
@@ -578,7 +583,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	DPrintf("Raft %x received msgApp [logterm: %d, index: %d, entries: %+v] from %x.\n", r.id, m.LogTerm, m.Index, m.Entries, m.From)
 	ents := make([]pb.Entry, 0, len(m.Entries))
 	for _, e := range m.Entries {
-		ents = append(ents, pb.Entry{EntryType: e.EntryType, Term: e.Term, Index: e.Index, Data: e.Data})
+		ents = append(ents, *e)
 	}
 	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, ents...); ok {
 		r.send(pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From, Index: mlastIndex})
