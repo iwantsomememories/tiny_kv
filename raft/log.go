@@ -15,13 +15,10 @@
 package raft
 
 import (
-	"errors"
 	"fmt"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
-
-var ErrExceedLastIndex = errors.New("requested index exceeds the lastIndex of raftlog")
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -240,7 +237,6 @@ func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
 	if after == nextIndex {
 		l.entries = append(l.entries, ents...)
 	} else if after < nextIndex {
-		DPrintf("truncate the entries before index %x", after)
 		l.entries = append([]pb.Entry{}, l.entries[:after-l.offset]...)
 		l.entries = append(l.entries, ents...)
 
