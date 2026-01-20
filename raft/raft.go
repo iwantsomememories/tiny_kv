@@ -111,6 +111,11 @@ func (c *Config) validate() error {
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
 	Match, Next uint64
+
+	// RecentActive is true if the progress is recently active. Receiving any messages
+	// from the corresponding follower indicates the progress is active.
+	// RecentActive can be reset to false after an election timeout.
+	RecentActive bool
 }
 
 func (p *Progress) maybeUpdate(n uint64) bool {
@@ -393,6 +398,9 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 		r.becomeFollower(m.Term, lead)
 	case m.Term < r.Term:
+		if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat {
+			r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse})
+		}
 		return nil
 	}
 
@@ -440,6 +448,12 @@ func stepLeader(r *Raft, m pb.Message) error {
 	case pb.MessageType_MsgBeat:
 		r.bcastHeartbeat()
 		return nil
+	case pb.MessageType_MsgCheckQuorum:
+		if !r.checkQuorumActive() {
+			r.logger.Warningf("stepped down to follower since quorum is not active.\n")
+			r.becomeFollower(r.Term, None)
+		}
+		return nil
 	case pb.MessageType_MsgPropose:
 		if len(m.Entries) == 0 {
 			return ErrProposalDropped
@@ -480,6 +494,8 @@ func stepLeader(r *Raft, m pb.Message) error {
 	}
 	switch m.MsgType {
 	case pb.MessageType_MsgAppendResponse:
+		pr.RecentActive = true
+
 		if m.Reject {
 			r.logger.Infof("received msgApp rejection(lastindex: %x) from %x for index %x", m.RejectHint, m.From, m.Index)
 			if pr.maybeDecrto(m.Index, m.RejectHint) {
@@ -500,6 +516,8 @@ func stepLeader(r *Raft, m pb.Message) error {
 			}
 		}
 	case pb.MessageType_MsgHeartbeatResponse:
+		pr.RecentActive = true
+
 		if pr.Match < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
 		}
@@ -632,6 +650,7 @@ func (r *Raft) tickHeartbeat() {
 
 	if r.electionElapsed >= r.electionTimeout {
 		r.electionElapsed = 0
+		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgCheckQuorum})
 		if r.State == StateLeader && r.leadTransferee != None {
 			r.abortLeaderTransfer()
 		}
@@ -773,6 +792,25 @@ func (r *Raft) poll(id uint64, t pb.MessageType, v bool) (granted int) {
 
 func (r *Raft) pastElectionTimeout() bool {
 	return r.electionElapsed >= r.randomizedElectionTimeout
+}
+
+func (r *Raft) checkQuorumActive() bool {
+	var act int
+
+	for id := range r.Prs {
+		if id == r.id {
+			act++
+			continue
+		}
+
+		if r.Prs[id].RecentActive {
+			act++
+		}
+
+		r.Prs[id].RecentActive = false
+	}
+
+	return act >= r.quorum()
 }
 
 func pendingConfChangeEntries(ents []pb.Entry) (pents []pb.Entry) {
