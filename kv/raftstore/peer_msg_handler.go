@@ -216,7 +216,43 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	if msg.AdminRequest != nil {
 		// TODO
 	} else if len(msg.Requests) > 0 {
+		for _, req := range msg.Requests {
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Get:
+				if err := util.CheckKeyInRegion(req.Get.Key, d.Region()); err != nil {
+					cb.Done(ErrRespWithTerm(err, d.Term()))
+					return
+				}
+			case raft_cmdpb.CmdType_Delete:
+				if err := util.CheckKeyInRegion(req.Delete.Key, d.Region()); err != nil {
+					cb.Done(ErrRespWithTerm(err, d.Term()))
+					return
+				}
+			case raft_cmdpb.CmdType_Put:
+				if err := util.CheckKeyInRegion(req.Put.Key, d.Region()); err != nil {
+					cb.Done(ErrRespWithTerm(err, d.Term()))
+					return
+				}
+			case raft_cmdpb.CmdType_Snap:
+				if cb.Txn != nil {
+					log.Panicf("%s found multi snap requests in one RaftCommand.", d.Tag)
+				}
+				cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+			}
+		}
 
+		data, err := msg.Marshal()
+		if err != nil {
+			log.Panicf("unexpected error: %s when marshal raft_cmdpb.RaftCmdRequest", err.Error())
+		}
+
+		proposalIndex := d.nextProposalIndex()
+		proposalTerm := d.Term()
+		if err = d.RaftGroup.Propose(data); err != nil {
+			cb.Done(ErrRespWithTerm(err, d.Term()))
+		} else {
+			d.proposals = append(d.proposals, &proposal{index: proposalIndex, term: proposalTerm, cb: cb})
+		}
 	} else {
 		log.Errorf("%s found a msg that normal requests and administrator request at same time", d.Tag)
 		cb.Done(ErrRespWithTerm(errors.Errorf("illegal request contain both normal requests and administrator request"), d.Term()))

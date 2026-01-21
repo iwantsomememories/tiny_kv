@@ -357,10 +357,10 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
 	batch := &engine_util.WriteBatch{}
+	ps.Append(ready.Entries, batch)
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &eraftpb.HardState{Term: ready.Term, Vote: ready.Vote, Commit: ready.Commit}
 	}
-	ps.Append(ready.Entries, batch)
 	if !raft.IsEmptySnap(&ready.Snapshot) {
 		// TODO
 	}

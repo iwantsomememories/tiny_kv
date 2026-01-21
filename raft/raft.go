@@ -253,7 +253,7 @@ func newRaft(c *Config) *Raft {
 		peersStrs = append(peersStrs, fmt.Sprintf("%x", p))
 	}
 
-	r.logger.Infof("start with [peers: [%s], term: %x, commit: %x, applied: %x, lastindex: %x, lastterm: %x]",
+	r.logger.Debugf("start with [peers: [%s], term: %x, commit: %x, applied: %x, lastindex: %x, lastterm: %x]",
 		strings.Join(peersStrs, ","), r.Term, r.RaftLog.committed, r.RaftLog.applied, r.RaftLog.LastIndex(), r.RaftLog.LastTerm())
 
 	return r
@@ -343,7 +343,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.State = StateFollower
 	r.Lead = lead
 
-	r.logger.Infof("became follower at term %x.\n", r.Term)
+	r.logger.Debugf("became follower at term %x.\n", r.Term)
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -353,7 +353,7 @@ func (r *Raft) becomeCandidate() {
 	r.State = StateCandidate
 	r.Vote = r.id
 
-	r.logger.Infof("became candidate at term %x.\n", r.Term)
+	r.logger.Debugf("became candidate at term %x.\n", r.Term)
 }
 
 // becomeLeader transform this peer's state to leader
@@ -378,14 +378,14 @@ func (r *Raft) becomeLeader() {
 	}
 
 	r.appendEntry(pb.Entry{Data: nil, EntryType: pb.EntryType_EntryNormal})
-	r.logger.Infof("became leader at term %x.\n", r.Term)
+	r.logger.Debugf("became leader at term %x.\n", r.Term)
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	r.logger.Infof("[state: %s, term: %x] received Msg{From: %x, Type: %s}.\n", r.State, r.Term, m.From, m.MsgType.String())
+	r.logger.Debugf("[state: %s, term: %x] received Msg{From: %x, Type: %s}.\n", r.State, r.Term, m.From, m.MsgType.String())
 
 	switch {
 	case m.Term == 0:
@@ -412,20 +412,20 @@ func (r *Raft) Step(m pb.Message) error {
 				r.logger.Warningf("cannot campaign at term %x since there are still %x pending configuration changes to apply.\n", r.Term, len(pents))
 				return nil
 			}
-			r.logger.Infof("start a new election at term %x.\n", r.Term)
+			r.logger.Debugf("start a new election at term %x.\n", r.Term)
 			r.campaign()
 		} else {
 			r.logger.Warningf("ignoring MsgHup because already leader.\n")
 		}
 	case pb.MessageType_MsgRequestVote:
 		if (r.Vote == None || r.Vote == m.From) && r.RaftLog.isUpToDate(m.Index, m.LogTerm) {
-			r.logger.Infof("[logterm: %x, index: %x, vote: %x] cast %s for %x [logterm: %x, index: %x] at term %x", r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
+			r.logger.Debugf("[logterm: %x, index: %x, vote: %x] cast %s for %x [logterm: %x, index: %x] at term %x", r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
 
 			r.send(pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, To: m.From})
 			r.electionElapsed = 0
 			r.Vote = m.From
 		} else {
-			r.logger.Infof("[logterm: %x, index: %x, vote: %x] rejected %s for %x [logterm: %x, index: %x] at term %x", r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
+			r.logger.Debugf("[logterm: %x, index: %x, vote: %x] rejected %s for %x [logterm: %x, index: %x] at term %x", r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
 
 			r.send(pb.Message{MsgType: pb.MessageType_MsgRequestVoteResponse, To: m.From, Reject: true})
 		}
@@ -497,9 +497,9 @@ func stepLeader(r *Raft, m pb.Message) error {
 		pr.RecentActive = true
 
 		if m.Reject {
-			r.logger.Infof("received msgApp rejection(lastindex: %x) from %x for index %x", m.RejectHint, m.From, m.Index)
+			r.logger.Debugf("received msgApp rejection(lastindex: %x) from %x for index %x", m.RejectHint, m.From, m.Index)
 			if pr.maybeDecrto(m.Index, m.RejectHint) {
-				r.logger.Infof("decreased progress of %x to [%+v].\n", m.From, pr)
+				r.logger.Debugf("decreased progress of %x to [%+v].\n", m.From, pr)
 				// try to send append again.
 				r.sendAppend(m.From)
 			}
@@ -531,7 +531,7 @@ func stepLeader(r *Raft, m pb.Message) error {
 func stepCandidate(r *Raft, m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgPropose:
-		r.logger.Infof("no leader at term %x; dropping proposal", r.Term)
+		r.logger.Debugf("no leader at term %x; dropping proposal", r.Term)
 	case pb.MessageType_MsgAppend:
 		r.becomeFollower(m.Term, m.From)
 		r.handleAppendEntries(m)
@@ -543,7 +543,7 @@ func stepCandidate(r *Raft, m pb.Message) error {
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgRequestVoteResponse:
 		gr := r.poll(m.From, m.MsgType, !m.Reject)
-		r.logger.Infof("[quorum:%d] has received %d %s votes and %d vote rejections", r.quorum(), gr, m.MsgType, len(r.votes)-gr)
+		r.logger.Debugf("[quorum:%d] has received %d %s votes and %d vote rejections", r.quorum(), gr, m.MsgType, len(r.votes)-gr)
 		switch r.quorum() {
 		case gr:
 			r.becomeLeader()
@@ -552,7 +552,7 @@ func stepCandidate(r *Raft, m pb.Message) error {
 			r.becomeFollower(r.Term, None)
 		}
 	case pb.MessageType_MsgTimeoutNow:
-		r.logger.Infof("[term: %x, state: %v] ignored MsgTimeoutNow from %x", r.Term, r.State, m.From)
+		r.logger.Debugf("[term: %x, state: %v] ignored MsgTimeoutNow from %x", r.Term, r.State, m.From)
 	}
 
 	return nil
@@ -601,7 +601,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		return
 	}
 
-	r.logger.Infof("received msgApp [logterm: %x, index: %x, entries: %+v] from %x.\n", m.LogTerm, m.Index, m.Entries, m.From)
+	r.logger.Debugf("received msgApp [logterm: %x, index: %x, entries: %+v] from %x.\n", m.LogTerm, m.Index, m.Entries, m.From)
 	ents := make([]pb.Entry, 0, len(m.Entries))
 	for _, e := range m.Entries {
 		ents = append(ents, *e)
@@ -609,7 +609,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, ents...); ok {
 		r.send(pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From, Index: mlastIndex})
 	} else {
-		r.logger.Infof("[logterm: %x, index: %x] rejected msgApp [logterm: %x, index: %x] from %x.\n", r.RaftLog.zeroTermOnErr(r.RaftLog.Term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
+		r.logger.Debugf("[logterm: %x, index: %x] rejected msgApp [logterm: %x, index: %x] from %x.\n", r.RaftLog.zeroTermOnErr(r.RaftLog.Term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
 		r.send(pb.Message{MsgType: pb.MessageType_MsgAppendResponse, To: m.From, Index: m.Index, Reject: true, RejectHint: r.RaftLog.LastIndex()})
 	}
 }
@@ -672,7 +672,7 @@ func (r *Raft) appendEntry(ents ...pb.Entry) {
 	}
 
 	r.RaftLog.append(ents...)
-	r.logger.Infof("append new ents{%+v} in its log.\n", ents)
+	r.logger.Debugf("append new ents{%+v} in its log.\n", ents)
 	r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
 	r.maybeCommit()
 }
@@ -704,7 +704,7 @@ func (r *Raft) campaign() {
 			continue
 		}
 
-		r.logger.Infof("[logterm: %x, index: %x] sent %s request to %x at term %x.\n", r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), msgType.String(), id, r.Term)
+		r.logger.Debugf("[logterm: %x, index: %x] sent %s request to %x at term %x.\n", r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), msgType.String(), id, r.Term)
 
 		msg := pb.Message{MsgType: msgType, To: id, Term: term, LogTerm: r.RaftLog.LastTerm(), Index: r.RaftLog.LastIndex()}
 		r.send(msg)
@@ -772,9 +772,9 @@ func (r *Raft) promotable() bool {
 
 func (r *Raft) poll(id uint64, t pb.MessageType, v bool) (granted int) {
 	if v {
-		r.logger.Infof("received %s from %x at term %x.\n", t, id, r.Term)
+		r.logger.Debugf("received %s from %x at term %x.\n", t, id, r.Term)
 	} else {
-		r.logger.Infof("received %s rejection from %x at term %x.\n", t, id, r.Term)
+		r.logger.Debugf("received %s rejection from %x at term %x.\n", t, id, r.Term)
 	}
 
 	if _, exist := r.votes[id]; !exist {
