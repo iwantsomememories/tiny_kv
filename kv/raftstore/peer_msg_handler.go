@@ -62,6 +62,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		for _, entry := range rd.CommittedEntries {
 			d.processEntry(entry)
 		}
+
+		d.RaftGroup.Advance(rd)
 	}
 }
 
@@ -71,41 +73,15 @@ func (d *peerMsgHandler) processEntry(entry eraftpb.Entry) {
 	} else if entry.Index > d.peerStorage.AppliedIndex()+1 {
 		log.Panicf("%s found gap between applied index[index: %x] and new committed entry[index: %x].\n ", d.Tag, d.peerStorage.AppliedIndex(), entry.Index)
 	} else {
-		resq := newCmdResp()
-		BindRespTerm(resq, d.Term())
+		resp := newCmdResp()
+		BindRespTerm(resp, d.Term())
 		kvWb := &engine_util.WriteBatch{}
 
 		switch entry.EntryType {
 		case eraftpb.EntryType_EntryConfChange:
 			// TODO
 		case eraftpb.EntryType_EntryNormal:
-			var cmd raft_cmdpb.Request
-			err := cmd.Unmarshal(entry.Data)
-			if err != nil {
-				log.Panicf("unexpected error %v when unmarshal eraftpb.Entry.Data to raft_cmdpb.Request.\n", err)
-			}
-
-			switch cmd.CmdType {
-			case raft_cmdpb.CmdType_Invalid:
-				log.Warningf("%s found CmdType_Invalid request at %x.\n", d.Tag, entry.Index)
-			case raft_cmdpb.CmdType_Get:
-				req := cmd.Get
-				val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Cf, req.Key)
-				if err != nil && err != badger.ErrKeyNotFound {
-					log.Panicf("unexpected error %v when GetCF[cf: %v, key: %v].\n", err, req.Cf, req.Key)
-				}
-				resq.Responses = append(resq.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}})
-			case raft_cmdpb.CmdType_Delete:
-				req := cmd.Delete
-				kvWb.DeleteCF(req.Cf, req.Key)
-				resq.Responses = append(resq.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{}})
-			case raft_cmdpb.CmdType_Put:
-				req := cmd.Put
-				kvWb.SetCF(req.Cf, req.Key, req.Value)
-				resq.Responses = append(resq.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{}})
-			case raft_cmdpb.CmdType_Snap:
-				resq.Responses = append(resq.Responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}})
-			}
+			d.applyNormal(entry, resp, kvWb)
 		}
 
 		d.peerStorage.applyState.AppliedIndex = entry.Index
@@ -115,20 +91,57 @@ func (d *peerMsgHandler) processEntry(entry eraftpb.Entry) {
 			log.Panicf("unexpected error %v when WriteToDB[wb: %+v].\n", err, kvWb)
 		}
 
-		if d.IsLeader() {
-			for i := range d.proposals {
-				if d.proposals[i].index == entry.Index {
-					if d.proposals[i].term != entry.Term {
-						d.proposals[i].cb.Done(ErrRespStaleCommand(d.Term()))
-					} else {
-						d.proposals[i].cb.Done(resq)
-					}
+		for i := range d.proposals {
+			if d.proposals[i] != nil && d.proposals[i].index == entry.Index {
+				if d.proposals[i].term != entry.Term {
+					d.proposals[i].cb.Done(ErrRespStaleCommand(d.Term()))
+				} else {
+					d.proposals[i].cb.Done(resp)
 				}
+
+				d.proposals[i] = d.proposals[len(d.proposals)-1]
+				d.proposals = d.proposals[:len(d.proposals)-1]
+				break
 			}
 		}
 	}
 
 	return
+}
+
+func (d *peerMsgHandler) applyNormal(entry eraftpb.Entry, rcResp *raft_cmdpb.RaftCmdResponse, kvWb *engine_util.WriteBatch) {
+	var rcReq raft_cmdpb.RaftCmdRequest
+	err := rcReq.Unmarshal(entry.Data)
+	if err != nil {
+		log.Panicf("unexpected error %v when unmarshal eraftpb.Entry.Data to raft_cmdpb.RaftCmdRequest.\n", err)
+	}
+
+	responses := []*raft_cmdpb.Response{}
+	for _, req := range rcReq.Requests {
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Invalid:
+			log.Warningf("%s found CmdType_Invalid request at %x.\n", d.Tag, entry.Index)
+			responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Invalid})
+		case raft_cmdpb.CmdType_Get:
+			req := req.Get
+			val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Cf, req.Key)
+			if err != nil && err != badger.ErrKeyNotFound {
+				log.Panicf("unexpected error %v when GetCF[cf: %v, key: %v].\n", err, req.Cf, req.Key)
+			}
+			responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}})
+		case raft_cmdpb.CmdType_Delete:
+			req := req.Delete
+			kvWb.DeleteCF(req.Cf, req.Key)
+			responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{}})
+		case raft_cmdpb.CmdType_Put:
+			req := req.Put
+			kvWb.SetCF(req.Cf, req.Key, req.Value)
+			responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{}})
+		case raft_cmdpb.CmdType_Snap:
+			responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}})
+		}
+	}
+	rcResp.Responses = responses
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -199,6 +212,16 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
+
+	if msg.AdminRequest != nil {
+		// TODO
+	} else if len(msg.Requests) > 0 {
+
+	} else {
+		log.Errorf("%s found a msg that normal requests and administrator request at same time", d.Tag)
+		cb.Done(ErrRespWithTerm(errors.Errorf("illegal request contain both normal requests and administrator request"), d.Term()))
+	}
+
 	// Your Code Here (2B).
 }
 

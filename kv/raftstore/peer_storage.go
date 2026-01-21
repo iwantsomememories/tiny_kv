@@ -361,6 +361,9 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		ps.raftState.HardState = &eraftpb.HardState{Term: ready.Term, Vote: ready.Vote, Commit: ready.Commit}
 	}
 	ps.Append(ready.Entries, batch)
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		// TODO
+	}
 	batch.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 
 	err := batch.WriteToDB(ps.Engines.Raft)
