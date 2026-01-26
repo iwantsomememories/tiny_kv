@@ -175,11 +175,25 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	return entries
 }
 
-func (l *RaftLog) FirstIndex() uint64 {
+func (l *RaftLog) snapshot() (pb.Snapshot, error) {
 	if l.pendingSnapshot != nil {
-		return l.pendingSnapshot.Metadata.Index + 1
+		return *l.pendingSnapshot, nil
 	}
 
+	return l.storage.Snapshot()
+}
+
+func (l *RaftLog) restore(snapshot *pb.Snapshot) {
+	l.committed = snapshot.Metadata.Index
+
+	l.entries = make([]pb.Entry, 0)
+	l.entries = append(l.entries, pb.Entry{Term: snapshot.Metadata.Term, Index: snapshot.Metadata.Index})
+	l.offset = snapshot.Metadata.Index
+	l.stabled = snapshot.Metadata.Index
+	l.pendingSnapshot = snapshot
+}
+
+func (l *RaftLog) FirstIndex() uint64 {
 	return l.offset + 1
 }
 

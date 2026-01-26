@@ -107,6 +107,22 @@ func (c *Config) validate() error {
 	return nil
 }
 
+const (
+	ProgressStateProbe ProgressStateType = iota
+	ProgressStateReplicate
+	ProgressStateSnapshot
+)
+
+type ProgressStateType uint64
+
+var prstmap = [...]string{
+	"ProgressStateProbe",
+	"ProgressStateReplicate",
+	"ProgressStateSnapshot",
+}
+
+func (st ProgressStateType) String() string { return prstmap[uint64(st)] }
+
 // Progress represents a follower’s progress in the view of the leader. Leader maintains
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
@@ -116,31 +132,108 @@ type Progress struct {
 	// from the corresponding follower indicates the progress is active.
 	// RecentActive can be reset to false after an election timeout.
 	RecentActive bool
+
+	State ProgressStateType
+	// Paused is used in ProgressStateProbe.
+	// When Paused is true, raft should pause sending replication message to this peer.
+	Paused bool
+
+	// PendingSnapshot is used in ProgressStateSnapshot.
+	// If there is a pending snapshot, the pendingSnapshot will be set to the
+	// index of the snapshot. If pendingSnapshot is set, the replication process of
+	// this Progress will be paused. raft will not resend snapshot until the pending one
+	// is reported to be failed.
+	PendingSnapshot uint64
 }
 
-func (p *Progress) maybeUpdate(n uint64) bool {
+func (pr *Progress) resetState(state ProgressStateType) {
+	pr.Paused = false
+	pr.PendingSnapshot = 0
+	pr.State = state
+}
+
+func (pr *Progress) becomeProbe() {
+	if pr.State == ProgressStateSnapshot {
+		pendingSnapshot := pr.PendingSnapshot
+		pr.resetState(ProgressStateProbe)
+		pr.Next = max(pr.Match+1, pendingSnapshot+1)
+	} else {
+		pr.resetState(ProgressStateProbe)
+		pr.Next = pr.Match + 1
+	}
+}
+
+func (pr *Progress) becomeSnapshot(snapshoti uint64) {
+	pr.resetState(ProgressStateSnapshot)
+	pr.PendingSnapshot = snapshoti
+}
+
+func (pr *Progress) becomeReplicate() {
+	pr.resetState(ProgressStateReplicate)
+	pr.Next = pr.Match + 1
+}
+
+func (pr *Progress) maybeUpdate(n uint64) bool {
 	var updated bool
-	if n > p.Match {
-		p.Match = n
+	if n > pr.Match {
+		pr.Match = n
 		updated = true
 	}
 
-	if n+1 > p.Next {
-		p.Next = n + 1
+	if n+1 > pr.Next {
+		pr.Next = n + 1
 	}
 
 	return updated
 }
 
-func (p *Progress) maybeDecrto(rejected, last uint64) bool {
-	if rejected != p.Next-1 { // outdated response
+func (pr *Progress) optimisticUpdate(n uint64) { pr.Next = n + 1 }
+
+func (pr *Progress) maybeDecrto(rejected, last uint64) bool {
+	if pr.State == ProgressStateReplicate {
+		if rejected <= pr.Match {
+			return false
+		}
+
+		pr.Next = pr.Match + 1
+		return true
+	}
+
+	if rejected != pr.Next-1 { // outdated response
 		return false
 	}
 
-	if p.Next = min(rejected, last+1); p.Next < 1 {
-		p.Next = 1
+	if pr.Next = min(rejected, last+1); pr.Next < 1 {
+		pr.Next = 1
 	}
+	pr.resume()
 	return true
+}
+
+func (pr *Progress) pause()  { pr.Paused = true }
+func (pr *Progress) resume() { pr.Paused = false }
+
+func (pr *Progress) IsPaused() bool {
+	switch pr.State {
+	case ProgressStateProbe:
+		return pr.Paused
+	case ProgressStateReplicate:
+		return false
+	case ProgressStateSnapshot:
+		return true
+	default:
+		panic("unexpected state")
+	}
+}
+
+func (pr *Progress) snapshotFailure() { pr.PendingSnapshot = 0 }
+
+func (pr *Progress) needSnapshotAbort() bool {
+	return pr.State == ProgressStateSnapshot && pr.Match >= pr.PendingSnapshot
+}
+
+func (pr *Progress) String() string {
+	return fmt.Sprintf("next = %d, match = %d, state = %s, waiting = %v, pendingSnapshot = %d", pr.Next, pr.Match, pr.State, pr.IsPaused(), pr.PendingSnapshot)
 }
 
 type Raft struct {
@@ -272,6 +365,11 @@ func (r *Raft) hardState() pb.HardState {
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	pr := r.Prs[to]
+	if pr.IsPaused() {
+		r.logger.Debugf("node %x paused.\n", to)
+		return false
+	}
+
 	m := pb.Message{}
 	m.To = to
 	m.MsgType = pb.MessageType_MsgAppend
@@ -280,8 +378,30 @@ func (r *Raft) sendAppend(to uint64) bool {
 	entries, erre := r.RaftLog.entriesAfter(pr.Next)
 
 	if errt != nil || (erre != nil && erre != ErrUnavailable) {
-		// todo
+		if !pr.RecentActive {
+			r.logger.Debugf("ignore sending snapshot to %x since it is not recently active", to)
+			return false
+		}
 
+		m.MsgType = pb.MessageType_MsgSnapshot
+		snapshot, err := r.RaftLog.snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				r.logger.Debugf("failed to send snapshot to %x because snapshot is temporarily unavailable", to)
+				return false
+			}
+			panic(err)
+		}
+
+		if IsEmptySnap(&snapshot) {
+			panic("need non-empty snapshot")
+		}
+
+		m.Snapshot = &snapshot
+		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+		r.logger.Debugf("[firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%+v]", r.RaftLog.FirstIndex(), r.RaftLog.committed, sindex, sterm, to, pr)
+
+		pr.becomeSnapshot(sindex)
 	} else {
 		m.Index = pr.Next - 1
 		m.LogTerm = term
@@ -292,8 +412,17 @@ func (r *Raft) sendAppend(to uint64) bool {
 				ents = append(ents, &pb.Entry{EntryType: entry.EntryType, Term: entry.Term, Index: entry.Index, Data: entry.Data})
 			}
 			m.Entries = ents
-		}
 
+			switch pr.State {
+			case ProgressStateProbe:
+				pr.pause()
+			case ProgressStateReplicate:
+				last := entries[len(entries)-1].Index
+				pr.optimisticUpdate(last)
+			default:
+				r.logger.Panicf("send append in unhandled state %s.\n", pr.State)
+			}
+		}
 	}
 	r.send(m)
 	return true
@@ -500,14 +629,28 @@ func stepLeader(r *Raft, m pb.Message) error {
 			r.logger.Debugf("received msgApp rejection(lastindex: %x) from %x for index %x", m.RejectHint, m.From, m.Index)
 			if pr.maybeDecrto(m.Index, m.RejectHint) {
 				r.logger.Debugf("decreased progress of %x to [%+v].\n", m.From, pr)
+				if pr.State == ProgressStateReplicate {
+					pr.becomeProbe()
+				}
 				// try to send append again.
 				r.sendAppend(m.From)
 			}
 		} else {
+			oldPaused := pr.IsPaused()
 			if pr.maybeUpdate(m.Index) {
+				switch {
+				case pr.State == ProgressStateProbe:
+					pr.becomeReplicate()
+				case pr.State == ProgressStateSnapshot && pr.needSnapshotAbort():
+					r.logger.Debugf("snapshot aborted, resumed sending replication messages to %x [%s]", m.From, pr)
+					pr.becomeProbe()
+				}
+
 				if r.maybeCommit() {
 					// if commit, then broadcast AppendEntries
 					r.bcastAppend()
+				} else if oldPaused {
+					r.sendAppend(m.From)
 				}
 
 				if m.From == r.leadTransferee && pr.Match == r.RaftLog.LastIndex() {
@@ -517,6 +660,7 @@ func stepLeader(r *Raft, m pb.Message) error {
 		}
 	case pb.MessageType_MsgHeartbeatResponse:
 		pr.RecentActive = true
+		pr.resume()
 
 		if pr.Match < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
@@ -624,6 +768,44 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+
+	if r.restore(m.Snapshot) {
+		r.logger.Debugf("[commit: %d] restored snapshot [index: %d, term: %d]", r.RaftLog.committed, sindex, sterm)
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()})
+	} else {
+		r.logger.Debugf("[commit: %d] ignored snapshot [index: %d, term: %d]", r.RaftLog.committed, sindex, sterm)
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed})
+	}
+}
+
+func (r *Raft) restore(snapshot *pb.Snapshot) bool {
+	sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+	if sindex < r.RaftLog.committed {
+		return false
+	}
+
+	if r.RaftLog.matchTerm(snapshot.Metadata.Index, snapshot.Metadata.Term) {
+		r.logger.Debugf("[commit: %d, lastindex: %d, lastterm: %d] fast-forwarded commit to snapshot [index: %d, term: %d]", r.RaftLog.committed, r.RaftLog.LastIndex(), r.RaftLog.LastTerm(), sindex, sterm)
+		r.RaftLog.commitTo(sindex)
+		return false
+	}
+
+	r.logger.Debugf("[commit: %d, lastindex: %d, lastterm: %d] starts to restore snapshot [index: %d, term: %d]", r.RaftLog.committed, r.RaftLog.LastIndex(), r.RaftLog.LastTerm(), sindex, sterm)
+
+	r.RaftLog.restore(snapshot)
+	r.Prs = make(map[uint64]*Progress)
+	for _, n := range snapshot.Metadata.ConfState.Nodes {
+		match, next := uint64(0), r.RaftLog.LastIndex()+1
+		if n == r.id {
+			match = next - 1
+		}
+
+		r.Prs[n] = &Progress{Match: match, Next: next}
+		r.logger.Debugf("restored progress of %x [%+v]", n, r.Prs[n])
+	}
+
+	return true
 }
 
 // addNode add a new node to raft group
