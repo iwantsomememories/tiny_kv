@@ -117,30 +117,43 @@ func (d *peerMsgHandler) applyNormal(entry eraftpb.Entry, rcResp *raft_cmdpb.Raf
 	}
 
 	responses := []*raft_cmdpb.Response{}
-	for _, req := range rcReq.Requests {
-		switch req.CmdType {
-		case raft_cmdpb.CmdType_Invalid:
-			log.Warningf("%s found CmdType_Invalid request at %x.\n", d.Tag, entry.Index)
-			responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Invalid})
-		case raft_cmdpb.CmdType_Get:
-			req := req.Get
-			val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Cf, req.Key)
-			if err != nil && err != badger.ErrKeyNotFound {
-				log.Panicf("unexpected error %v when GetCF[cf: %v, key: %v].\n", err, req.Cf, req.Key)
+
+	if rcReq.AdminRequest != nil {
+		switch rcReq.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			d.peerStorage.applyState.TruncatedState = &rspb.RaftTruncatedState{Index: rcReq.AdminRequest.CompactLog.CompactIndex, Term: rcReq.AdminRequest.CompactLog.CompactTerm}
+			d.ScheduleCompactLog(rcReq.AdminRequest.CompactLog.CompactIndex)
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+			// TODO
+			return
+		}
+	} else {
+		for _, req := range rcReq.Requests {
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Invalid:
+				log.Warningf("%s found CmdType_Invalid request at %x.\n", d.Tag, entry.Index)
+				responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Invalid})
+			case raft_cmdpb.CmdType_Get:
+				req := req.Get
+				val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Cf, req.Key)
+				if err != nil && err != badger.ErrKeyNotFound {
+					log.Panicf("unexpected error %v when GetCF[cf: %v, key: %v].\n", err, req.Cf, req.Key)
+				}
+				responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}})
+			case raft_cmdpb.CmdType_Delete:
+				req := req.Delete
+				kvWb.DeleteCF(req.Cf, req.Key)
+				responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{}})
+			case raft_cmdpb.CmdType_Put:
+				req := req.Put
+				kvWb.SetCF(req.Cf, req.Key, req.Value)
+				responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{}})
+			case raft_cmdpb.CmdType_Snap:
+				responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}})
 			}
-			responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Get, Get: &raft_cmdpb.GetResponse{Value: val}})
-		case raft_cmdpb.CmdType_Delete:
-			req := req.Delete
-			kvWb.DeleteCF(req.Cf, req.Key)
-			responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Delete, Delete: &raft_cmdpb.DeleteResponse{}})
-		case raft_cmdpb.CmdType_Put:
-			req := req.Put
-			kvWb.SetCF(req.Cf, req.Key, req.Value)
-			responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Put, Put: &raft_cmdpb.PutResponse{}})
-		case raft_cmdpb.CmdType_Snap:
-			responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}})
 		}
 	}
+
 	rcResp.Responses = responses
 }
 
@@ -214,7 +227,52 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	}
 
 	if msg.AdminRequest != nil {
-		// TODO
+		if len(msg.Requests) > 0 {
+			log.Errorf("%s found a msg that normal requests and administrator request at same time", d.Tag)
+			cb.Done(ErrRespWithTerm(errors.Errorf("illegal request contain both normal requests and administrator request"), d.Term()))
+			return
+		}
+
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			compactIndex := msg.AdminRequest.CompactLog.CompactIndex
+			compactTerm := msg.AdminRequest.CompactLog.CompactTerm
+
+			if compactIndex > d.peerStorage.AppliedIndex() {
+				log.Errorf("%s snapshot generation failed: compactIndex(%x) > appliedIndex(%x)", d.Tag, compactIndex, d.peerStorage.AppliedIndex())
+				cb.Done(ErrRespWithTerm(errors.Errorf("illegal compactIndex(%x) when appliedIndex=%x", compactIndex, d.peerStorage.AppliedIndex()), d.Term()))
+				return
+			}
+
+			if compactIndex <= d.peerStorage.truncatedIndex() {
+				log.Errorf("%s snapshot generation failed: compactIndex(%x) <= truncatedIndex(%x)", d.Tag, compactIndex, d.peerStorage.truncatedIndex())
+				cb.Done(ErrRespWithTerm(errors.Errorf("illegal compactIndex(%x) when truncatedIndex=%x", compactIndex, d.peerStorage.truncatedIndex()), d.Term()))
+				return
+			}
+
+			t, err := d.peerStorage.Term(compactIndex)
+			if err != nil || t != compactTerm {
+				log.Errorf("%s snapshot generation failed: compactIndex=%x, compactTerm=%x(mismatch with storage)", d.Tag, compactIndex, compactTerm)
+				cb.Done(ErrRespWithTerm(errors.Errorf("compactIndex=%x, compactTerm=%x(mismatch with storage)", compactIndex, compactTerm), d.Term()))
+				return
+			}
+
+			data, err := msg.Marshal()
+			if err != nil {
+				log.Panicf("unexpected error: %s when marshal raft_cmdpb.RaftCmdRequest", err.Error())
+			}
+
+			proposalIndex := d.nextProposalIndex()
+			proposalTerm := d.Term()
+			if err = d.RaftGroup.Propose(data); err != nil {
+				cb.Done(ErrRespWithTerm(err, d.Term()))
+			} else {
+				d.proposals = append(d.proposals, &proposal{index: proposalIndex, term: proposalTerm, cb: cb})
+			}
+		default:
+			// TODO
+			return
+		}
 	} else if len(msg.Requests) > 0 {
 		for _, req := range msg.Requests {
 			switch req.CmdType {
@@ -254,8 +312,8 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			d.proposals = append(d.proposals, &proposal{index: proposalIndex, term: proposalTerm, cb: cb})
 		}
 	} else {
-		log.Errorf("%s found a msg that normal requests and administrator request at same time", d.Tag)
-		cb.Done(ErrRespWithTerm(errors.Errorf("illegal request contain both normal requests and administrator request"), d.Term()))
+		log.Errorf("%s found a msg without any requests", d.Tag)
+		cb.Done(ErrRespWithTerm(errors.Errorf("empty requests"), d.Term()))
 	}
 
 	// Your Code Here (2B).

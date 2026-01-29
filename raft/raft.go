@@ -584,11 +584,15 @@ func stepLeader(r *Raft, m pb.Message) error {
 		}
 		return nil
 	case pb.MessageType_MsgPropose:
-		if len(m.Entries) == 0 {
+		if _, exist := r.Prs[r.id]; !exist {
 			return ErrProposalDropped
 		}
 
-		if _, exist := r.Prs[r.id]; !exist {
+		if _, exist := r.Prs[m.From]; exist {
+			r.Prs[m.From].RecentActive = true
+		}
+
+		if len(m.Entries) == 0 {
 			return ErrProposalDropped
 		}
 
