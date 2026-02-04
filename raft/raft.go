@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -47,6 +48,16 @@ var stmap = [...]string{
 func (st StateType) String() string {
 	return stmap[uint64(st)]
 }
+
+type CampaignType string
+
+const (
+	// campaignElection represents a normal (time-based) election (the second phase
+	// of the election when Config.PreVote is true).
+	campaignElection CampaignType = "CampaignElection"
+	// campaignTransfer represents the type of leader transfer
+	campaignTransfer CampaignType = "CampaignTransfer"
+)
 
 // ErrProposalDropped is returned when the proposal is ignored by some cases,
 // so that the proposer can be notified and fail fast.
@@ -225,8 +236,6 @@ func (pr *Progress) IsPaused() bool {
 		panic("unexpected state")
 	}
 }
-
-func (pr *Progress) snapshotFailure() { pr.PendingSnapshot = 0 }
 
 func (pr *Progress) needSnapshotAbort() bool {
 	return pr.State == ProgressStateSnapshot && pr.Match >= pr.PendingSnapshot
@@ -522,7 +531,17 @@ func (r *Raft) Step(m pb.Message) error {
 	case m.Term > r.Term:
 		lead := m.From
 		if m.MsgType == pb.MessageType_MsgRequestVote {
-			// todo
+			force := bytes.Equal(m.Context, []byte(campaignTransfer))
+			inLease := r.Lead != None && r.electionElapsed < r.electionTimeout
+
+			// If a server receives a RequestVote request within the minimum election timeout
+			// of hearing from a current leader, it does not update its term or grant its vote
+			if !force && inLease {
+				r.logger.Infof("[logterm: %d, index: %d, vote: %x] ignored %s from %x [logterm: %d, index: %d] at term %d: lease is not expired (remaining ticks: %d)", r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term, r.electionTimeout-r.electionElapsed)
+
+				return nil
+			}
+
 			lead = None
 		}
 		r.becomeFollower(m.Term, lead)
@@ -542,7 +561,7 @@ func (r *Raft) Step(m pb.Message) error {
 				return nil
 			}
 			r.logger.Debugf("start a new election at term %x.\n", r.Term)
-			r.campaign()
+			r.campaign(campaignElection)
 		} else {
 			r.logger.Warningf("ignoring MsgHup because already leader.\n")
 		}
@@ -605,12 +624,11 @@ func stepLeader(r *Raft, m pb.Message) error {
 		for _, e := range m.Entries {
 			if e.EntryType == pb.EntryType_EntryConfChange {
 				// todo
-				if r.PendingConfIndex != 0 {
+				if r.RaftLog.applied < r.PendingConfIndex {
 					r.logger.Warningf("propose conf %s ignored since pending unapplied configuration", e.String())
-					e.EntryType = pb.EntryType_EntryNormal
-				} else {
-					r.PendingConfIndex = e.Index
+					return ErrProposalDropped
 				}
+				r.PendingConfIndex = e.Index
 			}
 			ents = append(ents, pb.Entry{Index: e.Index, Term: e.Term, EntryType: e.EntryType, Data: e.Data})
 		}
@@ -671,6 +689,34 @@ func stepLeader(r *Raft, m pb.Message) error {
 		}
 	case pb.MessageType_MsgTransferLeader:
 		// todo
+		leadTransferee := m.From
+		lastLeadTransferee := r.leadTransferee
+
+		if lastLeadTransferee != None {
+			if lastLeadTransferee == leadTransferee {
+				r.logger.Infof("[term %d] transfer leadership to %x is in progress, ignores request to same node %x.\n",
+					r.Term, leadTransferee, leadTransferee)
+				return nil
+			}
+			r.abortLeaderTransfer()
+			r.logger.Infof("[term %d] abort previous transferring leadership to %x.\n", r.Term, lastLeadTransferee)
+		}
+
+		if leadTransferee == r.id {
+			r.logger.Debugf("is already leader. Ignored transferring leadership to self.\n")
+			return nil
+		}
+
+		r.logger.Infof("[term %d] starts to transfer leadership to %x.\n", r.Term, leadTransferee)
+
+		r.electionElapsed = 0
+		r.leadTransferee = leadTransferee
+		if pr.Match == r.RaftLog.LastIndex() {
+			r.sendTimeoutNow(leadTransferee)
+			r.logger.Infof("sends MsgTimeoutNow to %x immediately as %x already has up-to-date log", leadTransferee, leadTransferee)
+		} else {
+			r.sendAppend(lastLeadTransferee)
+		}
 	}
 
 	return nil
@@ -679,7 +725,7 @@ func stepLeader(r *Raft, m pb.Message) error {
 func stepCandidate(r *Raft, m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgPropose:
-		r.logger.Debugf("no leader at term %x; dropping proposal", r.Term)
+		r.logger.Infof("no leader at term %x; dropping proposal", r.Term)
 	case pb.MessageType_MsgAppend:
 		r.becomeFollower(m.Term, m.From)
 		r.handleAppendEntries(m)
@@ -691,7 +737,7 @@ func stepCandidate(r *Raft, m pb.Message) error {
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgRequestVoteResponse:
 		gr := r.poll(m.From, m.MsgType, !m.Reject)
-		r.logger.Debugf("[quorum:%d] has received %d %s votes and %d vote rejections", r.quorum(), gr, m.MsgType, len(r.votes)-gr)
+		r.logger.Infof("[quorum:%d] has received %d %s votes and %d vote rejections", r.quorum(), gr, m.MsgType, len(r.votes)-gr)
 		switch r.quorum() {
 		case gr:
 			r.becomeLeader()
@@ -700,7 +746,7 @@ func stepCandidate(r *Raft, m pb.Message) error {
 			r.becomeFollower(r.Term, None)
 		}
 	case pb.MessageType_MsgTimeoutNow:
-		r.logger.Debugf("[term: %x, state: %v] ignored MsgTimeoutNow from %x", r.Term, r.State, m.From)
+		r.logger.Infof("[term: %x, state: %v] ignored MsgTimeoutNow from %x", r.Term, r.State, m.From)
 	}
 
 	return nil
@@ -709,12 +755,8 @@ func stepCandidate(r *Raft, m pb.Message) error {
 func stepFollower(r *Raft, m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgPropose:
-		if r.Lead == None {
-			r.logger.Warningf("no leader at term %x; dropping proposal", r.Term)
-			return ErrProposalDropped
-		}
-		m.To = r.Lead
-		r.send(m)
+		r.logger.Warningf("[term=%x]is not leader; dropping propose msg.\n", r.Term)
+		return ErrProposalDropped
 	case pb.MessageType_MsgAppend:
 		r.electionElapsed = 0
 		r.Lead = m.From
@@ -728,14 +770,15 @@ func stepFollower(r *Raft, m pb.Message) error {
 		r.Lead = m.From
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgTimeoutNow:
-		// todo
-	case pb.MessageType_MsgTransferLeader:
-		if r.Lead == None {
-			r.logger.Warningf("no leader at term %x; dropping leader transfer msg", r.Term)
-			return ErrProposalDropped
+		if r.promotable() {
+			r.logger.Infof("[term %d] received MsgTimeoutNow from %x and starts an election to get leadership.\n", r.Term, m.From)
+			r.campaign(campaignTransfer)
+		} else {
+			r.logger.Infof("received MsgTimeoutNow from %x but is not promotable.\n", m.From)
 		}
-		m.To = r.Lead
-		r.send(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.logger.Warningf("[term=%x]is not leader; dropping leader transfer msg.\n", r.Term)
+		return ErrProposalDropped
 	}
 
 	return nil
@@ -815,11 +858,29 @@ func (r *Raft) restore(snapshot *pb.Snapshot) bool {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if _, exist := r.Prs[id]; exist {
+		return
+	}
+
+	r.Prs[id] = &Progress{Match: 0, Next: r.RaftLog.LastIndex() + 1}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	delete(r.Prs, id)
+
+	if len(r.Prs) == 0 {
+		return
+	}
+
+	if r.maybeCommit() {
+		r.bcastAppend()
+	}
+
+	if r.State == StateLeader && r.leadTransferee == id {
+		r.abortLeaderTransfer()
+	}
 }
 
 func (r *Raft) tickElection() {
@@ -875,7 +936,7 @@ func (r *Raft) maybeCommit() bool {
 	return r.RaftLog.maybeCommit(mci, r.Term)
 }
 
-func (r *Raft) campaign() {
+func (r *Raft) campaign(t CampaignType) {
 	r.becomeCandidate()
 	term := r.Term
 	msgType := pb.MessageType_MsgRequestVote
@@ -889,10 +950,14 @@ func (r *Raft) campaign() {
 		if id == r.id {
 			continue
 		}
+		r.logger.Infof("[logterm: %x, index: %x] sent %s request to %x at term %x.\n", r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), msgType.String(), id, r.Term)
 
-		r.logger.Debugf("[logterm: %x, index: %x] sent %s request to %x at term %x.\n", r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), msgType.String(), id, r.Term)
+		var ctx []byte
+		if t == campaignTransfer {
+			ctx = []byte(t)
+		}
 
-		msg := pb.Message{MsgType: msgType, To: id, Term: term, LogTerm: r.RaftLog.LastTerm(), Index: r.RaftLog.LastIndex()}
+		msg := pb.Message{MsgType: msgType, To: id, Term: term, LogTerm: r.RaftLog.LastTerm(), Index: r.RaftLog.LastIndex(), Context: ctx}
 		r.send(msg)
 	}
 }
@@ -945,6 +1010,10 @@ func (r *Raft) reset(term uint64) {
 
 func (r *Raft) resetRandomizedElectionTimeout() {
 	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+}
+
+func (r *Raft) sendTimeoutNow(to uint64) {
+	r.send(pb.Message{To: to, MsgType: pb.MessageType_MsgTimeoutNow})
 }
 
 func (r *Raft) abortLeaderTransfer() {

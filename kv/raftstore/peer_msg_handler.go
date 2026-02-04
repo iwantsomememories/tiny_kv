@@ -79,22 +79,15 @@ func (d *peerMsgHandler) processEntry(entry eraftpb.Entry) {
 
 		switch entry.EntryType {
 		case eraftpb.EntryType_EntryConfChange:
-			// TODO
+			d.applyConfChange(entry, resp, kvWb)
 		case eraftpb.EntryType_EntryNormal:
 			d.applyNormal(entry, resp, kvWb)
-		}
-
-		d.peerStorage.applyState.AppliedIndex = entry.Index
-		kvWb.SetMeta(meta.ApplyStateKey(d.Region().Id), d.peerStorage.applyState)
-		err := kvWb.WriteToDB(d.peerStorage.Engines.Kv)
-		if err != nil {
-			log.Panicf("unexpected error %v when WriteToDB[wb: %+v].\n", err, kvWb)
 		}
 
 		for i := range d.proposals {
 			if d.proposals[i] != nil && d.proposals[i].index == entry.Index {
 				if d.proposals[i].term != entry.Term {
-					d.proposals[i].cb.Done(ErrRespStaleCommand(d.Term()))
+					NotifyStaleReq(d.Term(), d.proposals[i].cb)
 				} else {
 					d.proposals[i].cb.Done(resp)
 				}
@@ -123,9 +116,6 @@ func (d *peerMsgHandler) applyNormal(entry eraftpb.Entry, rcResp *raft_cmdpb.Raf
 		case raft_cmdpb.AdminCmdType_CompactLog:
 			d.peerStorage.applyState.TruncatedState = &rspb.RaftTruncatedState{Index: rcReq.AdminRequest.CompactLog.CompactIndex, Term: rcReq.AdminRequest.CompactLog.CompactTerm}
 			d.ScheduleCompactLog(rcReq.AdminRequest.CompactLog.CompactIndex)
-		case raft_cmdpb.AdminCmdType_TransferLeader:
-			// TODO
-			return
 		}
 	} else {
 		for _, req := range rcReq.Requests {
@@ -155,6 +145,69 @@ func (d *peerMsgHandler) applyNormal(entry eraftpb.Entry, rcResp *raft_cmdpb.Raf
 	}
 
 	rcResp.Responses = responses
+
+	d.flushBatchWithAppliedIndex(entry.Index, kvWb)
+}
+
+func (d *peerMsgHandler) applyConfChange(entry eraftpb.Entry, rcResp *raft_cmdpb.RaftCmdResponse, kvWb *engine_util.WriteBatch) {
+	peers := d.peerStorage.Region().Peers
+
+	var confChange eraftpb.ConfChange
+	err := confChange.Unmarshal(entry.Data)
+	if err != nil {
+		log.Panicf("unexpected error %s when unmarshal eraftpb.Entry.Data to eraftpb.ConfChange.\n", err)
+	}
+
+	var changePeerRequest raft_cmdpb.ChangePeerRequest
+	err = changePeerRequest.Unmarshal(confChange.Context)
+	if err != nil {
+		log.Panicf("unexpected error %s when unmarshal eraftpb.ConfChange.Context to raft_cmdpb.ChangePeerRequest.\n", err)
+	}
+
+	if d.isDuplicateConfChange(confChange.ChangeType, changePeerRequest.Peer.StoreId) {
+		rcResp = ErrRespStaleCommand(d.Term())
+		return
+	}
+
+	target_store_id := changePeerRequest.Peer.StoreId
+	switch confChange.ChangeType {
+	case eraftpb.ConfChangeType_AddNode:
+		peers = append(peers, changePeerRequest.Peer)
+	case eraftpb.ConfChangeType_RemoveNode:
+		for i := range peers {
+			if peers[i].StoreId == target_store_id {
+				peers[i] = peers[len(peers)-1]
+				peers = peers[:len(peers)-1]
+				if target_store_id == d.regionId {
+					d.destroyPeer()
+					return
+				}
+				break
+			}
+		}
+	}
+
+	d.peerStorage.region.RegionEpoch.ConfVer++
+	d.peerStorage.region.Peers = peers
+	kvWb.SetMeta(meta.RegionStateKey(d.regionId), d.peerStorage.region)
+	d.RaftGroup.ApplyConfChange(confChange)
+
+	d.flushBatchWithAppliedIndex(entry.Index, kvWb)
+
+	meta := d.ctx.storeMeta
+	meta.Lock()
+	defer meta.Unlock()
+	meta.regions[d.regionId].RegionEpoch = &metapb.RegionEpoch{ConfVer: d.Region().RegionEpoch.ConfVer, Version: d.Region().RegionEpoch.Version}
+	meta.regions[d.regionId].Peers = append(make([]*metapb.Peer, 0), d.Region().Peers...)
+}
+
+func (d *peerMsgHandler) flushBatchWithAppliedIndex(index uint64, kvWb *engine_util.WriteBatch) {
+	d.peerStorage.applyState.AppliedIndex = index
+	kvWb.SetMeta(meta.ApplyStateKey(d.Region().Id), d.peerStorage.applyState)
+	err := kvWb.WriteToDB(d.peerStorage.Engines.Kv)
+	if err != nil {
+		log.Panicf("unexpected error %v when WriteToDB[wb: %+v].\n", err, kvWb)
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -269,6 +322,33 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			} else {
 				d.proposals = append(d.proposals, &proposal{index: proposalIndex, term: proposalTerm, cb: cb})
 			}
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+			d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+			resp := newCmdResp()
+			BindRespTerm(resp, d.Term())
+			cb.Done(resp)
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+			changeType := msg.AdminRequest.ChangePeer.ChangeType
+			peer := msg.AdminRequest.ChangePeer.Peer
+
+			if d.isDuplicateConfChange(changeType, peer.StoreId) {
+				NotifyStaleReq(d.Term(), cb)
+				return
+			}
+
+			context, err := msg.AdminRequest.ChangePeer.Marshal()
+			if err != nil {
+				log.Panicf("unexpected error %s when masrshal msg.AdminRequest.ChangePeer", err)
+			}
+
+			proposalIndex := d.nextProposalIndex()
+			proposalTerm := d.Term()
+			err = d.RaftGroup.ProposeConfChange(eraftpb.ConfChange{ChangeType: changeType, NodeId: peer.Id, Context: context})
+			if err != nil {
+				cb.Done(ErrRespWithTerm(err, proposalTerm))
+			} else {
+				d.proposals = append(d.proposals, &proposal{index: proposalIndex, term: proposalTerm, cb: cb})
+			}
 		default:
 			// TODO
 			return
@@ -307,7 +387,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		proposalIndex := d.nextProposalIndex()
 		proposalTerm := d.Term()
 		if err = d.RaftGroup.Propose(data); err != nil {
-			cb.Done(ErrRespWithTerm(err, d.Term()))
+			cb.Done(ErrRespWithTerm(err, proposalTerm))
 		} else {
 			d.proposals = append(d.proposals, &proposal{index: proposalIndex, term: proposalTerm, cb: cb})
 		}
@@ -317,6 +397,17 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	}
 
 	// Your Code Here (2B).
+}
+
+// check whether the conf change has already been applied.
+func (d *peerMsgHandler) isDuplicateConfChange(confChangeType eraftpb.ConfChangeType, storeId uint64) bool {
+	peer := util.FindPeer(d.Region(), storeId)
+
+	if confChangeType == eraftpb.ConfChangeType_AddNode {
+		return peer != nil
+	} else {
+		return peer == nil
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
