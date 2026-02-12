@@ -116,6 +116,8 @@ func (d *peerMsgHandler) applyNormal(entry eraftpb.Entry, rcResp *raft_cmdpb.Raf
 		case raft_cmdpb.AdminCmdType_CompactLog:
 			d.peerStorage.applyState.TruncatedState = &rspb.RaftTruncatedState{Index: rcReq.AdminRequest.CompactLog.CompactIndex, Term: rcReq.AdminRequest.CompactLog.CompactTerm}
 			d.ScheduleCompactLog(rcReq.AdminRequest.CompactLog.CompactIndex)
+		case raft_cmdpb.AdminCmdType_Split:
+
 		}
 	} else {
 		for _, req := range rcReq.Requests {
@@ -288,8 +290,9 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 
 		switch msg.AdminRequest.CmdType {
 		case raft_cmdpb.AdminCmdType_CompactLog:
-			compactIndex := msg.AdminRequest.CompactLog.CompactIndex
-			compactTerm := msg.AdminRequest.CompactLog.CompactTerm
+			compactLogReq := msg.AdminRequest.CompactLog
+			compactIndex := compactLogReq.CompactIndex
+			compactTerm := compactLogReq.CompactTerm
 
 			if compactIndex > d.peerStorage.AppliedIndex() {
 				log.Errorf("%s snapshot generation failed: compactIndex(%x) > appliedIndex(%x)", d.Tag, compactIndex, d.peerStorage.AppliedIndex())
@@ -328,8 +331,9 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			BindRespTerm(resp, d.Term())
 			cb.Done(resp)
 		case raft_cmdpb.AdminCmdType_ChangePeer:
-			changeType := msg.AdminRequest.ChangePeer.ChangeType
-			peer := msg.AdminRequest.ChangePeer.Peer
+			changePeerReq := msg.AdminRequest.ChangePeer
+			changeType := changePeerReq.ChangeType
+			peer := changePeerReq.Peer
 
 			if d.isDuplicateConfChange(changeType, peer.StoreId) {
 				NotifyStaleReq(d.Term(), cb)
@@ -349,9 +353,30 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			} else {
 				d.proposals = append(d.proposals, &proposal{index: proposalIndex, term: proposalTerm, cb: cb})
 			}
-		default:
-			// TODO
-			return
+		case raft_cmdpb.AdminCmdType_Split:
+			splitReq := msg.AdminRequest.Split
+
+			splitKey := splitReq.SplitKey
+			if err := util.CheckKeyInRegion(splitKey, d.Region()); err != nil {
+				cb.Done(ErrRespWithTerm(err, d.Term()))
+				return
+			}
+
+			data, err := msg.Marshal()
+			if err != nil {
+				log.Panicf("unexpected error: %s when marshal raft_cmdpb.RaftCmdRequest", err.Error())
+			}
+
+			proposalIndex := d.nextProposalIndex()
+			proposalTerm := d.Term()
+			if err = d.RaftGroup.Propose(data); err != nil {
+				cb.Done(ErrRespWithTerm(err, proposalTerm))
+			} else {
+				d.proposals = append(d.proposals, &proposal{index: proposalIndex, term: proposalTerm, cb: cb})
+			}
+		case raft_cmdpb.AdminCmdType_InvalidAdmin:
+			log.Warningf("%s reveived InvalidAdmin.\n", d.Tag)
+			cb.Done(ErrRespWithTerm(errors.Errorf("InvalidAdmin"), d.Term()))
 		}
 	} else if len(msg.Requests) > 0 {
 		for _, req := range msg.Requests {
@@ -395,9 +420,9 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		log.Errorf("%s found a msg without any requests", d.Tag)
 		cb.Done(ErrRespWithTerm(errors.Errorf("empty requests"), d.Term()))
 	}
-
-	// Your Code Here (2B).
 }
+
+// TODO (propose And proposeConfChange)
 
 // check whether the conf change has already been applied.
 func (d *peerMsgHandler) isDuplicateConfChange(confChangeType eraftpb.ConfChangeType, storeId uint64) bool {
