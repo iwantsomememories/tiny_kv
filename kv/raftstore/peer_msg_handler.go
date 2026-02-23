@@ -98,8 +98,6 @@ func (d *peerMsgHandler) processEntry(entry eraftpb.Entry) {
 			}
 		}
 	}
-
-	return
 }
 
 func (d *peerMsgHandler) applyNormal(entry eraftpb.Entry, rcResp *raft_cmdpb.RaftCmdResponse, kvWb *engine_util.WriteBatch) {
@@ -116,8 +114,59 @@ func (d *peerMsgHandler) applyNormal(entry eraftpb.Entry, rcResp *raft_cmdpb.Raf
 		case raft_cmdpb.AdminCmdType_CompactLog:
 			d.peerStorage.applyState.TruncatedState = &rspb.RaftTruncatedState{Index: rcReq.AdminRequest.CompactLog.CompactIndex, Term: rcReq.AdminRequest.CompactLog.CompactTerm}
 			d.ScheduleCompactLog(rcReq.AdminRequest.CompactLog.CompactIndex)
-		case raft_cmdpb.AdminCmdType_Split:
 
+			rcResp.AdminResponse.CmdType = raft_cmdpb.AdminCmdType_CompactLog
+		case raft_cmdpb.AdminCmdType_Split:
+			if util.IsEpochStale(rcReq.Header.RegionEpoch, d.Region().RegionEpoch) {
+				BindRespError(rcResp, new(util.ErrStaleCommand))
+				return
+			}
+
+			newRegionId := rcReq.AdminRequest.Split.NewRegionId
+			newPeerIds := rcReq.AdminRequest.Split.NewPeerIds
+			splitKey := rcReq.AdminRequest.Split.SplitKey
+
+			// build new peer and register
+			oldPeers := d.Region().Peers
+			if len(oldPeers) != len(newPeerIds) {
+				log.Errorf("%s split failed -- the num of new peers and old peers doesn't match.", d.Tag)
+				BindRespError(rcResp, errors.Errorf("the num of new peers and old peers doesn't match."))
+				return
+			}
+			newPeers := make([]*metapb.Peer, 0)
+			for i := range oldPeers {
+				newPeers = append(newPeers, &metapb.Peer{Id: newPeerIds[i], StoreId: oldPeers[i].StoreId})
+			}
+
+			newRegion := metapb.Region{
+				Id:          newRegionId,
+				StartKey:    splitKey,
+				EndKey:      d.Region().EndKey,
+				Peers:       newPeers,
+				RegionEpoch: &metapb.RegionEpoch{},
+			}
+
+			newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, &newRegion)
+			if err != nil {
+				log.Panicf("failed to create new peer!")
+			}
+
+			d.ctx.router.register(newPeer)
+
+			// update old region information
+			d.peerStorage.region.EndKey = splitKey
+			d.peerStorage.region.RegionEpoch.Version++
+
+			meta := d.ctx.storeMeta
+			meta.Lock()
+			// TODO
+			meta.Unlock()
+
+			rcResp.AdminResponse.CmdType = raft_cmdpb.AdminCmdType_Split
+			regions := make([]*metapb.Region, 2)
+			regions[0] = d.Region()
+			regions[1] = &newRegion
+			rcResp.AdminResponse.Split.Regions = regions
 		}
 	} else {
 		for _, req := range rcReq.Requests {
@@ -144,9 +193,8 @@ func (d *peerMsgHandler) applyNormal(entry eraftpb.Entry, rcResp *raft_cmdpb.Raf
 				responses = append(responses, &raft_cmdpb.Response{CmdType: raft_cmdpb.CmdType_Snap, Snap: &raft_cmdpb.SnapResponse{Region: d.Region()}})
 			}
 		}
+		rcResp.Responses = responses
 	}
-
-	rcResp.Responses = responses
 
 	d.flushBatchWithAppliedIndex(entry.Index, kvWb)
 }
@@ -194,13 +242,16 @@ func (d *peerMsgHandler) applyConfChange(entry eraftpb.Entry, rcResp *raft_cmdpb
 	kvWb.SetMeta(meta.RegionStateKey(d.regionId), d.peerStorage.region)
 	d.RaftGroup.ApplyConfChange(confChange)
 
-	d.flushBatchWithAppliedIndex(entry.Index, kvWb)
-
 	meta := d.ctx.storeMeta
 	meta.Lock()
-	defer meta.Unlock()
 	meta.regions[d.regionId].RegionEpoch = &metapb.RegionEpoch{ConfVer: d.Region().RegionEpoch.ConfVer, Version: d.Region().RegionEpoch.Version}
 	meta.regions[d.regionId].Peers = append(make([]*metapb.Peer, 0), d.Region().Peers...)
+	meta.Unlock()
+
+	rcResp.AdminResponse.CmdType = raft_cmdpb.AdminCmdType_ChangePeer
+	rcResp.AdminResponse.ChangePeer.Region = d.Region()
+
+	d.flushBatchWithAppliedIndex(entry.Index, kvWb)
 }
 
 func (d *peerMsgHandler) flushBatchWithAppliedIndex(index uint64, kvWb *engine_util.WriteBatch) {
@@ -329,6 +380,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
 			resp := newCmdResp()
 			BindRespTerm(resp, d.Term())
+			resp.AdminResponse.CmdType = raft_cmdpb.AdminCmdType_TransferLeader
 			cb.Done(resp)
 		case raft_cmdpb.AdminCmdType_ChangePeer:
 			changePeerReq := msg.AdminRequest.ChangePeer
@@ -421,8 +473,6 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrRespWithTerm(errors.Errorf("empty requests"), d.Term()))
 	}
 }
-
-// TODO (propose And proposeConfChange)
 
 // check whether the conf change has already been applied.
 func (d *peerMsgHandler) isDuplicateConfChange(confChangeType eraftpb.ConfChangeType, storeId uint64) bool {

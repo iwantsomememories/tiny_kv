@@ -117,16 +117,10 @@ func NewRawNode(config *Config) (*RawNode, error) {
 
 	if lastIndex == 0 {
 		r.becomeFollower(1, None)
-
-		// todo(add confChange logs)
 	}
 
 	rn.prevSoftSt = r.softState()
-	if lastIndex == 0 {
-		rn.prevHardSt = pb.HardState{}
-	} else {
-		rn.prevHardSt = r.hardState()
-	}
+	rn.prevHardSt = r.hardState()
 
 	return rn, nil
 }
