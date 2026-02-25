@@ -157,15 +157,26 @@ func (d *peerMsgHandler) applyNormal(entry eraftpb.Entry, rcResp *raft_cmdpb.Raf
 			d.peerStorage.region.EndKey = splitKey
 			d.peerStorage.region.RegionEpoch.Version++
 
-			meta := d.ctx.storeMeta
-			meta.Lock()
-			// TODO
-			meta.Unlock()
+			storeMeta := d.ctx.storeMeta
+			clonedRegion1, clonedRegion2 := new(metapb.Region), new(metapb.Region)
+			if err1, err2 := util.CloneMsg(d.Region(), clonedRegion1), util.CloneMsg(&newRegion, clonedRegion2); err1 != nil || err2 != nil {
+				log.Panic("failed to clone region")
+			}
+
+			storeMeta.Lock()
+			storeMeta.regions[d.regionId] = clonedRegion1
+			storeMeta.regions[newRegionId] = clonedRegion2
+			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: clonedRegion1})
+			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: clonedRegion2})
+			storeMeta.Unlock()
+
+			kvWb.SetMeta(meta.RegionStateKey(clonedRegion1.Id), clonedRegion1)
+			kvWb.SetMeta(meta.RegionStateKey(clonedRegion2.Id), clonedRegion2)
 
 			rcResp.AdminResponse.CmdType = raft_cmdpb.AdminCmdType_Split
 			regions := make([]*metapb.Region, 2)
-			regions[0] = d.Region()
-			regions[1] = &newRegion
+			regions[0] = clonedRegion1
+			regions[1] = clonedRegion2
 			rcResp.AdminResponse.Split.Regions = regions
 		}
 	} else {
@@ -239,17 +250,21 @@ func (d *peerMsgHandler) applyConfChange(entry eraftpb.Entry, rcResp *raft_cmdpb
 
 	d.peerStorage.region.RegionEpoch.ConfVer++
 	d.peerStorage.region.Peers = peers
-	kvWb.SetMeta(meta.RegionStateKey(d.regionId), d.peerStorage.region)
 	d.RaftGroup.ApplyConfChange(confChange)
 
-	meta := d.ctx.storeMeta
-	meta.Lock()
-	meta.regions[d.regionId].RegionEpoch = &metapb.RegionEpoch{ConfVer: d.Region().RegionEpoch.ConfVer, Version: d.Region().RegionEpoch.Version}
-	meta.regions[d.regionId].Peers = append(make([]*metapb.Peer, 0), d.Region().Peers...)
-	meta.Unlock()
+	storeMeta := d.ctx.storeMeta
+	clonedRegion := new(metapb.Region)
+	if err = util.CloneMsg(d.Region(), clonedRegion); err != nil {
+		log.Panic("failed to clone region.")
+	}
+	storeMeta.Lock()
+	storeMeta.regions[clonedRegion.Id] = clonedRegion
+	storeMeta.Unlock()
+
+	kvWb.SetMeta(meta.RaftStateKey(clonedRegion.Id), clonedRegion)
 
 	rcResp.AdminResponse.CmdType = raft_cmdpb.AdminCmdType_ChangePeer
-	rcResp.AdminResponse.ChangePeer.Region = d.Region()
+	rcResp.AdminResponse.ChangePeer.Region = clonedRegion
 
 	d.flushBatchWithAppliedIndex(entry.Index, kvWb)
 }
