@@ -20,6 +20,13 @@ import (
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
+type SnapshotStatus int
+
+const (
+	SnapshotFinish  SnapshotStatus = 1
+	SnapshotFailure SnapshotStatus = 2
+)
+
 // ErrStepLocalMsg is returned when try to step a local raft message
 var ErrStepLocalMsg = errors.New("raft: cannot step raft local message")
 
@@ -235,6 +242,18 @@ func (rn *RawNode) GetProgress() map[uint64]Progress {
 		}
 	}
 	return prs
+}
+
+// ReportUnreachable reports the given node is not reachable for the last send.
+func (rn *RawNode) ReportUnreachable(id uint64) {
+	_ = rn.Raft.Step(pb.Message{MsgType: pb.MessageType_MsgUnreachable, From: id})
+}
+
+// ReportSnapshot reports the status of the sent snapshot.
+func (rn *RawNode) ReportSnapshot(id uint64, status SnapshotStatus) {
+	rej := status == SnapshotFailure
+
+	_ = rn.Raft.Step(pb.Message{MsgType: pb.MessageType_MsgSnapStatus, From: id, Reject: rej})
 }
 
 // TransferLeader tries to transfer leadership to the given transferee.

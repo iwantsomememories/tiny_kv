@@ -52,7 +52,7 @@ type PeerStorage struct {
 
 // NewPeerStorage get the persist raftState from engines and return a peer storage
 func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionSched chan<- worker.Task, tag string) (*PeerStorage, error) {
-	log.Debugf("%s creating storage for %s", tag, region.String())
+	log.DPrintfRaft("%s creating storage for %s", tag, region.String())
 	raftState, err := meta.InitRaftLocalState(engines.Raft, region)
 	if err != nil {
 		return nil, err
@@ -339,7 +339,8 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 
 // Apply the peer with given snapshot
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
-	log.Infof("%v begin to apply snapshot", ps.Tag)
+	log.DPrintfPeerStorage("%v begin to apply snapshot", ps.Tag)
+
 	snapData := new(rspb.RaftSnapshotData)
 	if err := snapData.Unmarshal(snapshot.Data); err != nil {
 		return nil, err
@@ -349,34 +350,45 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	if err := ps.clearMeta(kvWB, raftWB); err != nil {
-		return nil, err
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
 	}
-	ps.clearExtraData(snapData.Region)
-	prevRegion := ps.region
-	newRegion := snapData.Region
+
+	sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+
+	ps.raftState.LastIndex = sindex
+	ps.raftState.LastTerm = sterm
+
+	ps.raftState.HardState.Commit = sindex
+	ps.raftState.HardState.Term = sterm
+
+	ps.applyState.AppliedIndex = sindex
+	ps.applyState.TruncatedState = &rspb.RaftTruncatedState{
+		Index: sindex,
+		Term:  sterm,
+	}
+
+	kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.Id), ps.applyState)
 
 	ps.snapState.StateType = snap.SnapState_Applying
 	defer func() {
 		ps.snapState.StateType = snap.SnapState_Relax
 	}()
 	notifier := make(chan bool, 1)
-	applyTask := &runner.RegionTaskApply{RegionId: newRegion.Id, Notifier: notifier, SnapMeta: snapshot.Metadata, StartKey: prevRegion.StartKey, EndKey: prevRegion.EndKey}
-	ps.regionSched <- applyTask
-
-	ps.region = newRegion
-
-	sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
-	ps.raftState.LastIndex = sindex
-	ps.raftState.LastTerm = sterm
-	ps.raftState.HardState.Commit = sindex
-	ps.applyState = &rspb.RaftApplyState{AppliedIndex: sindex, TruncatedState: &rspb.RaftTruncatedState{Index: sindex, Term: sterm}}
-
-	kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
-	kvWB.SetMeta(meta.RegionStateKey(ps.region.Id), ps.region)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.Id,
+		Notifier: notifier,
+		SnapMeta: snapshot.Metadata,
+		StartKey: ps.region.StartKey,
+		EndKey:   ps.region.EndKey,
+	}
 
 	if res := <-notifier; res {
-		return &ApplySnapResult{PrevRegion: prevRegion, Region: ps.region}, nil
+		meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+		return &ApplySnapResult{PrevRegion: ps.Region(), Region: snapData.Region}, nil
 	} else {
 		return nil, fmt.Errorf("failed to apply snapshot.")
 	}

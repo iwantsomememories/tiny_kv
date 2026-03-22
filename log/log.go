@@ -280,3 +280,44 @@ func NewLogger(w io.Writer, prefix string) *Logger {
 	}
 	return &Logger{_log: log.New(w, prefix, LstdFlags), level: level, highlighting: true}
 }
+
+const debug = 0
+const debug_raft = 1
+const debug_raftStore = 1
+const debug_peerStorage = 1
+const debug_peerMsgHandler = 1
+
+func DPrintf(format string, a ...interface{}) {
+	if debug > 0 {
+		Debugf(format, a...)
+	}
+	return
+}
+
+func DPrintfRaft(format string, a ...interface{}) {
+	if debug_raft > 0 {
+		Debugf("[Raft]: "+format, a...)
+	}
+	return
+}
+
+func DPrintfRaftStore(format string, a ...interface{}) {
+	if debug_raftStore > 0 {
+		Debugf("[RaftStore]: "+format, a...)
+	}
+	return
+}
+
+func DPrintfPeerStorage(format string, a ...interface{}) {
+	if debug_peerStorage > 0 {
+		Debugf("[PeerStorage]: "+format, a...)
+	}
+	return
+}
+
+func DPrintfPeerMsgHandler(format string, a ...interface{}) {
+	if debug_peerMsgHandler > 0 {
+		Debugf("[PeerMsgHandler]: "+format, a...)
+	}
+	return
+}

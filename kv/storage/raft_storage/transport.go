@@ -6,7 +6,9 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/util/worker"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
+	"github.com/pingcap-incubator/tinykv/raft"
 )
 
 type ServerTransport struct {
@@ -81,6 +83,12 @@ func (t *ServerTransport) SendSnapshotSock(addr string, msg *raft_serverpb.RaftM
 		toPeerID := msg.GetToPeer().GetId()
 		toStoreID := msg.GetToPeer().GetStoreId()
 		log.Debugf("send snapshot. toPeerID: %v, toStoreID: %v, regionID: %v, status: %v", toPeerID, toStoreID, regionID, err)
+
+		if err == nil {
+			t.reportSnapStatus(msg, raft.SnapshotFinish)
+		} else {
+			t.reportSnapStatus(msg, raft.SnapshotFailure)
+		}
 	}
 
 	t.snapScheduler <- &sendSnapTask{
@@ -88,6 +96,30 @@ func (t *ServerTransport) SendSnapshotSock(addr string, msg *raft_serverpb.RaftM
 		msg:      msg,
 		callback: callback,
 	}
+}
+
+func (t *ServerTransport) reportSnapStatus(msg *raft_serverpb.RaftMessage, status raft.SnapshotStatus) {
+	statusMsg := &eraftpb.Message{
+		MsgType: eraftpb.MessageType_MsgSnapStatus,
+		From:    msg.ToPeer.Id,
+		To:      msg.FromPeer.Id,
+	}
+
+	if status == raft.SnapshotFailure {
+		statusMsg.Reject = true
+	}
+
+	newMsg := &raft_serverpb.RaftMessage{
+		RegionId:    msg.RegionId,
+		FromPeer:    msg.FromPeer,
+		ToPeer:      msg.ToPeer,
+		Message:     statusMsg,
+		RegionEpoch: msg.RegionEpoch,
+		StartKey:    msg.StartKey,
+		EndKey:      msg.EndKey,
+	}
+
+	t.raftRouter.SendRaftMessage(newMsg)
 }
 
 func (t *ServerTransport) Flush() {

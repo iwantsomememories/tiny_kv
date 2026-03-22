@@ -68,6 +68,10 @@ enum MessageType {
     MsgTimeoutNow = 12;
     // 'MessageType_MsgCheckQuorum' is a local message used for checking quorum.
     MsgCheckQuorum = 13;
+    // 'MsgUnreachable' is used to report that the node is currently unreachable.
+    MsgUnreachable = 14;
+    // 'MsgSnapStatus' is used to report that the current snapshot receiving status of a node.
+    MsgSnapStatus = 15;
 }
 
 message Message {

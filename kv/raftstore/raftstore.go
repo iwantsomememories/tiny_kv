@@ -104,8 +104,8 @@ type Transport interface {
 	Send(msg *rspb.RaftMessage) error
 }
 
-/// loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
-/// WARN: This store should not be used before initialized.
+// / loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
+// / WARN: This store should not be used before initialized.
 func (bs *Raftstore) loadPeers() ([]*peer, error) {
 	// Scan region meta to get saved regions.
 	startKey := meta.RegionMetaMinKey
@@ -266,8 +266,10 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	workers := bs.workers
 	router := bs.router
 	bs.wg.Add(2) // raftWorker, storeWorker
+	// 主要处理各个 region/peer 的 raft 相关消息和状态推进。
 	rw := newRaftWorker(ctx, router)
 	go rw.run(bs.closeCh, bs.wg)
+	// 主要处理整个 store 级别的任务，而不是单个 region 的逻辑。
 	sw := newStoreWorker(ctx, bs.storeState)
 	go sw.run(bs.closeCh, bs.wg)
 	router.sendStore(message.Msg{Type: message.MsgTypeStoreStart, Data: ctx.store})
@@ -277,9 +279,13 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	}
 	engines := ctx.engine
 	cfg := ctx.cfg
+	// 负责检查 region 是否需要 split，比如 region 数据量过大时触发分裂。
 	workers.splitCheckWorker.Start(runner.NewSplitCheckHandler(engines.Kv, NewRaftstoreRouter(router), cfg))
+	// 负责 region 相关任务，典型包括 snapshot 应用等重操作。
 	workers.regionWorker.Start(runner.NewRegionTaskHandler(engines, ctx.snapMgr))
+	// 负责清理过旧的 raft log，避免日志无限增长。
 	workers.raftLogGCWorker.Start(runner.NewRaftLogGCTaskHandler())
+	// 负责与调度器（如 PD）交互，上报 store/region 状态、接收调度相关任务等。
 	workers.schedulerWorker.Start(runner.NewSchedulerTaskHandler(ctx.store.Id, ctx.schedulerClient, NewRaftstoreRouter(router)))
 	go bs.tickDriver.run()
 }
