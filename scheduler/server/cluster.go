@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/schedulerpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/logutil"
@@ -279,6 +280,67 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+	c.Lock()
+	defer c.Unlock()
+
+	meta := region.GetMeta()
+	oldRegion := c.GetRegion(meta.Id)
+	if oldRegion != nil {
+		// 本地存储中存在一个相同id的region
+
+		oldRegionEpoch := oldRegion.GetRegionEpoch()
+		if util.IsEpochStale(meta.RegionEpoch, oldRegionEpoch) {
+			return nil
+		}
+
+		// 判断是否需要更新
+		needUpdate := false
+		if util.IsEpochStale(oldRegionEpoch, meta.RegionEpoch) {
+			needUpdate = true
+		} else if !util.PeerEqual(region.GetLeader(), oldRegion.GetLeader()) {
+			needUpdate = true
+		} else if len(oldRegion.GetPendingPeers()) > 0 || len(region.GetPendingPeers()) > 0 {
+			needUpdate = true
+		} else if oldRegion.GetApproximateSize() != region.GetApproximateSize() {
+			needUpdate = true
+		}
+
+		if needUpdate {
+			c.core.PutRegion(region)
+
+			for _, p := range region.GetPeers() {
+				// 更新新Region所涉及的store信息
+				c.updateStoreStatusLocked(p.StoreId)
+			}
+		}
+	} else {
+		// 本地存储中不存在一个相同id的region
+		overlapRegions := c.core.GetOverlaps(region)
+		if len(overlapRegions) > 0 {
+			for _, overlapRegion := range overlapRegions {
+				if util.IsEpochStale(meta.RegionEpoch, overlapRegion.GetMeta().RegionEpoch) {
+					return nil
+				}
+			}
+		}
+
+		overlapRegions = c.core.PutRegion(region)
+		involvedStores := make(map[uint64]bool)
+		for _, p := range meta.Peers {
+			involvedStores[p.StoreId] = true
+		}
+
+		for _, overlapRegion := range overlapRegions {
+			for _, p := range overlapRegion.GetPeers() {
+				involvedStores[p.StoreId] = true
+			}
+		}
+
+		// 更新新Region所涉及的store信息
+		for sid := range involvedStores {
+			c.updateStoreStatusLocked(sid)
+		}
+	}
 
 	return nil
 }
@@ -625,6 +687,7 @@ func (c *RaftCluster) SetStoreWeight(storeID uint64, leaderWeight, regionWeight 
 	return c.putStoreLocked(newStore)
 }
 
+// 保存store信息（默认已获取锁）
 func (c *RaftCluster) putStoreLocked(store *core.StoreInfo) error {
 	if c.storage != nil {
 		if err := c.storage.SaveStore(store.GetMeta()); err != nil {
