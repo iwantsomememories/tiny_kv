@@ -388,9 +388,9 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
 		BindRespTerm(resp, d.Term())
 
 		needSnapTxn := false
-		var callback func()
+		var notifyScheduler func()
 		if cmd.AdminRequest != nil {
-			callback = d.processAdminRequest(&cmd, resp, kvWb)
+			notifyScheduler = d.processAdminRequest(&cmd, resp, kvWb)
 		} else {
 			responses := make([]*raft_cmdpb.Response, 0)
 
@@ -451,8 +451,8 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
 			d.flushBatchWithAppliedIndex(entry.Index, kvWb)
 		}
 
-		if callback != nil {
-			callback()
+		if notifyScheduler != nil {
+			notifyScheduler()
 		}
 
 		if p != nil && needSnapTxn {

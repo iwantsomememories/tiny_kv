@@ -284,13 +284,17 @@ func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	defer c.Unlock()
 
 	meta := region.GetMeta()
+	if region.GetRegionEpoch() == nil {
+		return errors.Errorf("RegionEpoch can't be nil.")
+	}
+
 	oldRegion := c.GetRegion(meta.Id)
 	if oldRegion != nil {
 		// 本地存储中存在一个相同id的region
 
 		oldRegionEpoch := oldRegion.GetRegionEpoch()
 		if util.IsEpochStale(meta.RegionEpoch, oldRegionEpoch) {
-			return nil
+			return ErrRegionIsStale(region.GetMeta(), oldRegion.GetMeta())
 		}
 
 		// 判断是否需要更新
@@ -302,6 +306,9 @@ func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 		} else if len(oldRegion.GetPendingPeers()) > 0 || len(region.GetPendingPeers()) > 0 {
 			needUpdate = true
 		} else if oldRegion.GetApproximateSize() != region.GetApproximateSize() {
+			needUpdate = true
+		} else if len(oldRegion.GetPeers()) != len(region.GetPeers()) {
+			// 为了通过 TestRegionAddBackPeers3C 和 TestRegionRemovePeers3C
 			needUpdate = true
 		}
 
@@ -319,7 +326,7 @@ func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 		if len(overlapRegions) > 0 {
 			for _, overlapRegion := range overlapRegions {
 				if util.IsEpochStale(meta.RegionEpoch, overlapRegion.GetMeta().RegionEpoch) {
-					return nil
+					return ErrRegionIsStale(region.GetMeta(), overlapRegion.GetMeta())
 				}
 			}
 		}
