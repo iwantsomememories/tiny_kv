@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/latches"
+	"github.com/pingcap-incubator/tinykv/kv/transaction/mvcc"
 	coppb "github.com/pingcap-incubator/tinykv/proto/pkg/coprocessor"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/tinykvpb"
@@ -47,20 +50,242 @@ func (server *Server) Snapshot(stream tinykvpb.TinyKv_SnapshotServer) error {
 	return server.storage.(*raft_storage.RaftStorage).Snapshot(stream)
 }
 
+func (server *Server) acquireLatches(keys [][]byte) {
+	for {
+		wg := server.Latches.AcquireLatches(keys)
+		if wg == nil {
+			return
+		}
+		wg.Wait()
+	}
+}
+
 // Transactional API.
 func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcpb.GetResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	response := &kvrpcpb.GetResponse{}
+
+	// 创建事务
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		response.RegionError = util.RaftstoreErrToPbError(err)
+		return response, nil
+	}
+	defer reader.Close()
+	startTs := req.Version
+	mvccTxn := mvcc.NewMvccTxn(reader, startTs)
+
+	// 检查是否上锁
+	userKey := req.Key
+	lock, err := mvccTxn.GetLock(userKey)
+	if err != nil {
+		if _, ok := err.(*util.ErrKeyNotInRegion); ok {
+			response.RegionError = util.RaftstoreErrToPbError(err)
+			return response, nil
+		} else {
+			// 内部错误，不返回给客户端
+			return response, err
+		}
+	}
+
+	if lock.IsLockedFor(userKey, startTs, response) {
+		return response, nil
+	}
+
+	val, err := mvccTxn.GetValue(userKey)
+	if err != nil {
+		if _, ok := err.(*util.ErrKeyNotInRegion); ok {
+			response.RegionError = util.RaftstoreErrToPbError(err)
+			return response, nil
+		} else {
+			// 内部错误，不返回给客户端
+			return response, err
+		}
+	}
+
+	response.Value = val
+	if val == nil {
+		response.NotFound = true
+	}
+
+	return response, nil
 }
 
 func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest) (*kvrpcpb.PrewriteResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	response := &kvrpcpb.PrewriteResponse{}
+
+	// 获取相关key对应latch
+	mutations := req.Mutations
+	keysToLatch := make([][]byte, 0, len(mutations))
+	for _, mutation := range mutations {
+		keysToLatch = append(keysToLatch, mutation.Key)
+	}
+
+	server.acquireLatches(keysToLatch)
+	defer server.Latches.ReleaseLatches(keysToLatch)
+
+	// 创建事务
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		response.RegionError = util.RaftstoreErrToPbError(err)
+		return response, nil
+	}
+	defer reader.Close()
+	startTs := req.StartVersion
+	mvccTxn := mvcc.NewMvccTxn(reader, startTs)
+
+	primaryKey := req.PrimaryLock
+
+	for _, mutation := range mutations {
+		// 检查是否已上锁
+		userKey := mutation.Key
+		lock, err := mvccTxn.GetLock(userKey)
+		if err != nil {
+			if _, ok := err.(*util.ErrKeyNotInRegion); ok {
+				response.RegionError = util.RaftstoreErrToPbError(err)
+				return response, nil
+			} else {
+				// 内部错误，不返回给客户端
+				return response, err
+			}
+		}
+
+		if lock != nil {
+			if lock.Ts != startTs {
+				// 其他事务锁住了Key
+				response.Errors = append(response.Errors, &kvrpcpb.KeyError{
+					Locked: lock.Info(userKey),
+				})
+			}
+			continue
+		}
+
+		// 检查是否写冲突
+		write, commitTs, err := mvccTxn.MostRecentWrite(userKey)
+		if err != nil {
+			// 内部错误，不返回给客户端
+			return response, err
+		}
+
+		if write != nil && commitTs > req.StartVersion {
+			response.Errors = append(response.Errors, &kvrpcpb.KeyError{
+				Conflict: &kvrpcpb.WriteConflict{
+					StartTs:    startTs,
+					ConflictTs: commitTs,
+					Key:        userKey,
+					Primary:    primaryKey,
+				},
+			})
+			continue
+		}
+
+		// 写入Lock
+		newWriteKind := mvcc.WriteKindFromProto(mutation.Op)
+		newLock := &mvcc.Lock{
+			Primary: primaryKey,
+			Ts:      startTs,
+			Ttl:     req.LockTtl,
+			Kind:    newWriteKind,
+		}
+		mvccTxn.PutLock(userKey, newLock)
+
+		// 写入Default
+		switch newWriteKind {
+		case mvcc.WriteKindPut:
+			mvccTxn.PutValue(userKey, mutation.Value)
+		case mvcc.WriteKindDelete:
+			mvccTxn.DeleteValue(userKey)
+		case mvcc.WriteKindRollback:
+			// Rollback类型不需要实际写入Default
+		}
+	}
+
+	// 持久化
+	if len(response.Errors) == 0 {
+		// 所有key都成功上锁
+		err = server.storage.Write(req.Context, mvccTxn.Writes())
+		if err != nil {
+			response.RegionError = util.RaftstoreErrToPbError(err)
+		}
+	}
+
+	return response, nil
 }
 
 func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*kvrpcpb.CommitResponse, error) {
 	// Your Code Here (4B).
-	return nil, nil
+	response := &kvrpcpb.CommitResponse{}
+
+	// 获取相关key对应latch
+	keysToLatch := req.Keys
+	server.acquireLatches(keysToLatch)
+	defer server.Latches.ReleaseLatches(keysToLatch)
+
+	// 创建事务
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		response.RegionError = util.RaftstoreErrToPbError(err)
+		return response, nil
+	}
+	defer reader.Close()
+	startTs := req.StartVersion
+	mvccTxn := mvcc.NewMvccTxn(reader, startTs)
+
+	// 检查所有Key是否成功上锁
+	for _, userKey := range keysToLatch {
+		lock, err := mvccTxn.GetLock(userKey)
+		if err != nil {
+			if _, ok := err.(*util.ErrKeyNotInRegion); ok {
+				response.RegionError = util.RaftstoreErrToPbError(err)
+				return response, nil
+			} else {
+				// 内部错误，不返回给客户端
+				return response, err
+			}
+		}
+
+		committed := false
+		if lock == nil {
+			// Lock不存在，检查是否已经Write
+			write, _, err := mvccTxn.CurrentWrite(userKey)
+			if err != nil {
+				// 内部错误，不返回给客户端
+				return response, err
+			}
+
+			if write == nil {
+				// 没有Prewrite的情况下直接返回成功
+				continue
+			} else if write.Kind == mvcc.WriteKindRollback {
+				// 已回滚
+				response.Error = &kvrpcpb.KeyError{Abort: fmt.Sprintf("Txn already rolled back on key %s", string(userKey))}
+				return response, nil
+			}
+			committed = true
+		} else if lock.Ts != startTs {
+			// Lock属于其他事务
+			response.Error = &kvrpcpb.KeyError{Retryable: fmt.Sprintf("Other txn's lock(ts=%v) on key %s", lock.Ts, string(userKey))}
+			return response, nil
+		}
+
+		if !committed {
+			// 写入Write并删除Lock
+			mvccTxn.PutWrite(userKey, req.CommitVersion, &mvcc.Write{
+				StartTS: startTs,
+				Kind:    lock.Kind,
+			})
+			mvccTxn.DeleteLock(userKey)
+		}
+	}
+
+	// 持久化
+	err = server.storage.Write(req.Context, mvccTxn.Writes())
+	if err != nil {
+		response.RegionError = util.RaftstoreErrToPbError(err)
+	}
+
+	return response, nil
 }
 
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {

@@ -183,11 +183,6 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 			return nil, 0, err
 		}
 
-		if write.Kind == WriteKindRollback {
-			// 忽略中止事务
-			continue
-		}
-
 		if write.StartTS == txn.StartTS {
 			commitTs := decodeTimestamp(rawKey)
 			return write, commitTs, nil
