@@ -84,7 +84,7 @@ func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcp
 			return response, nil
 		} else {
 			// 内部错误，不返回给客户端
-			return response, err
+			return nil, err
 		}
 	}
 
@@ -99,7 +99,7 @@ func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcp
 			return response, nil
 		} else {
 			// 内部错误，不返回给客户端
-			return response, err
+			return nil, err
 		}
 	}
 
@@ -147,7 +147,7 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 				return response, nil
 			} else {
 				// 内部错误，不返回给客户端
-				return response, err
+				return nil, err
 			}
 		}
 
@@ -165,7 +165,7 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 		write, commitTs, err := mvccTxn.MostRecentWrite(userKey)
 		if err != nil {
 			// 内部错误，不返回给客户端
-			return response, err
+			return nil, err
 		}
 
 		if write != nil && commitTs > req.StartVersion {
@@ -195,7 +195,7 @@ func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest
 		case mvcc.WriteKindPut:
 			mvccTxn.PutValue(userKey, mutation.Value)
 		case mvcc.WriteKindDelete:
-			mvccTxn.DeleteValue(userKey)
+			// Delete类型不需要实际删除Default
 		case mvcc.WriteKindRollback:
 			// Rollback类型不需要实际写入Default
 		}
@@ -241,7 +241,7 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 				return response, nil
 			} else {
 				// 内部错误，不返回给客户端
-				return response, err
+				return nil, err
 			}
 		}
 
@@ -251,7 +251,7 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 			write, _, err := mvccTxn.CurrentWrite(userKey)
 			if err != nil {
 				// 内部错误，不返回给客户端
-				return response, err
+				return nil, err
 			}
 
 			if write == nil {
@@ -290,16 +290,136 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	response := &kvrpcpb.ScanResponse{}
+	if req.Limit == 0 {
+		return response, nil
+	}
+
+	// 创建事务
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		response.RegionError = util.RaftstoreErrToPbError(err)
+		return response, nil
+	}
+	mvccTxn := mvcc.NewMvccTxn(reader, req.Version)
+
+	scanner := mvcc.NewScanner(req.StartKey, mvccTxn)
+	defer scanner.Close()
+
+	pairs := []*kvrpcpb.KvPair{}
+	for len(pairs) < int(req.Limit) {
+		key, val, err := scanner.Next()
+		if err != nil {
+			return nil, err
+		}
+		if key == nil {
+			break
+		}
+		pairs = append(pairs, &kvrpcpb.KvPair{
+			Key:   key,
+			Value: val,
+		})
+	}
+
+	response.Pairs = pairs
+	return response, nil
 }
 
 func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	response := &kvrpcpb.CheckTxnStatusResponse{}
+
+	keysToLatch := [][]byte{req.PrimaryKey}
+	server.acquireLatches(keysToLatch)
+	defer server.Latches.ReleaseLatches(keysToLatch)
+
+	// 创建事务
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		response.RegionError = util.RaftstoreErrToPbError(err)
+		return response, nil
+	}
+	defer reader.Close()
+	mvccTxn := mvcc.NewMvccTxn(reader, req.LockTs)
+
+	lock, err := mvccTxn.GetLock(req.PrimaryKey)
+	if err != nil {
+		// 内部错误，不返回给客户端
+		return nil, err
+	}
+
+	if lock != nil && lock.Ts == req.LockTs {
+		// Lock存在且属于要检查的事务
+		if mvcc.PhysicalTime(req.CurrentTs)-mvcc.PhysicalTime(lock.Ts) >= lock.Ttl {
+			// Lock已经过期
+
+			// 回滚并删除锁
+			mvccTxn.PutWrite(req.PrimaryKey, req.CurrentTs, &mvcc.Write{
+				StartTS: req.LockTs,
+				Kind:    mvcc.WriteKindRollback,
+			})
+			mvccTxn.DeleteLock(lock.Primary)
+
+			response.Action = kvrpcpb.Action_TTLExpireRollback
+		} else {
+			// Lock尚未过期
+			response.LockTtl = lock.Ttl
+			response.Action = kvrpcpb.Action_NoAction
+		}
+	} else {
+		// 检查是否已提交或回滚
+		write, commitTs, err := mvccTxn.CurrentWrite(req.PrimaryKey)
+		if err != nil {
+			// 内部错误，不返回给客户端
+			return nil, err
+		}
+
+		if write == nil {
+			// 进行回滚
+			mvccTxn.PutWrite(req.PrimaryKey, req.CurrentTs, &mvcc.Write{
+				StartTS: req.LockTs,
+				Kind:    mvcc.WriteKindRollback,
+			})
+			response.Action = kvrpcpb.Action_LockNotExistRollback
+		} else if write.Kind == mvcc.WriteKindRollback {
+			// 已回滚
+			response.Action = kvrpcpb.Action_NoAction
+		} else {
+			// 已提交
+			response.Action = kvrpcpb.Action_NoAction
+			response.CommitVersion = commitTs
+		}
+	}
+
+	if len(mvccTxn.Writes()) > 0 {
+		err = server.storage.Write(req.Context, mvccTxn.Writes())
+		if err != nil {
+			response.RegionError = util.RaftstoreErrToPbError(err)
+		}
+	}
+
+	return response, nil
 }
 
 func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollbackRequest) (*kvrpcpb.BatchRollbackResponse, error) {
 	// Your Code Here (4C).
+	response := &kvrpcpb.BatchRollbackResponse{}
+
+	keysToLatch := req.Keys
+	server.acquireLatches(keysToLatch)
+	defer server.Latches.ReleaseLatches(keysToLatch)
+
+	// 创建事务
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		response.RegionError = util.RaftstoreErrToPbError(err)
+		return response, nil
+	}
+	defer reader.Close()
+	mvccTxn := mvcc.NewMvccTxn(reader, req.StartVersion)
+
+	// todo
+
 	return nil, nil
 }
 
