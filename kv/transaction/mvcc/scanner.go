@@ -5,6 +5,7 @@ import (
 
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	"github.com/pingcap-incubator/tinykv/log"
 )
 
 // Scanner is used for reading multiple sequential key/value pairs from the storage layer. It is aware of the implementation
@@ -48,6 +49,8 @@ func (scan *Scanner) Close() {
 
 // 寻找下一个与curKey不同的userKey
 func (scan *Scanner) advanceToNextUserKey(curKey []byte) {
+	defer log.Debugf("[Scanner(startTs: %v)] advance to key(%v) from key(%v).", scan.startTs, scan.currentKey, curKey)
+
 	for ; scan.iter.Valid(); scan.iter.Next() {
 		item := scan.iter.Item()
 		rawKey := item.Key()
@@ -73,6 +76,7 @@ func (scan *Scanner) Next() ([]byte, []byte, error) {
 
 	for scan.currentKey != nil {
 		seekKey := append([]byte{}, scan.currentKey...)
+		log.Debugf("[Scanner(startTs: %v)] try to seek %v.", scan.startTs, seekKey)
 
 		scan.iter.Seek(EncodeKey(seekKey, TsMax))
 		if !scan.iter.Valid() {
@@ -101,12 +105,14 @@ func (scan *Scanner) Next() ([]byte, []byte, error) {
 				return userKey, nil, err
 			}
 
+			deleted := false
 			switch write.Kind {
 			case WriteKindRollback:
 				continue
 			case WriteKindDelete:
+				log.Debugf("[Scanner(startTs: %v)] found deleted key(%v).", scan.startTs, userKey)
 				scan.advanceToNextUserKey(userKey)
-				break
+				deleted = true
 			case WriteKindPut:
 				userVal, err := scan.reader.GetCF(engine_util.CfDefault, EncodeKey(userKey, write.StartTS))
 				scan.advanceToNextUserKey(userKey)
@@ -114,6 +120,10 @@ func (scan *Scanner) Next() ([]byte, []byte, error) {
 					return userKey, nil, err
 				}
 				return userKey, userVal, nil
+			}
+
+			if deleted {
+				break
 			}
 		}
 

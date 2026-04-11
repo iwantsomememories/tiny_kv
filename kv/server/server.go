@@ -10,6 +10,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/latches"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/mvcc"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	coppb "github.com/pingcap-incubator/tinykv/proto/pkg/coprocessor"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/tinykvpb"
@@ -354,11 +355,12 @@ func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnS
 			// Lock已经过期
 
 			// 回滚并删除锁
-			mvccTxn.PutWrite(req.PrimaryKey, req.CurrentTs, &mvcc.Write{
+			mvccTxn.DeleteLock(req.PrimaryKey)
+			mvccTxn.DeleteValue(req.PrimaryKey)
+			mvccTxn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
 				StartTS: req.LockTs,
 				Kind:    mvcc.WriteKindRollback,
 			})
-			mvccTxn.DeleteLock(lock.Primary)
 
 			response.Action = kvrpcpb.Action_TTLExpireRollback
 		} else {
@@ -376,7 +378,7 @@ func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnS
 
 		if write == nil {
 			// 进行回滚
-			mvccTxn.PutWrite(req.PrimaryKey, req.CurrentTs, &mvcc.Write{
+			mvccTxn.PutWrite(req.PrimaryKey, req.LockTs, &mvcc.Write{
 				StartTS: req.LockTs,
 				Kind:    mvcc.WriteKindRollback,
 			})
@@ -418,14 +420,127 @@ func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollb
 	defer reader.Close()
 	mvccTxn := mvcc.NewMvccTxn(reader, req.StartVersion)
 
-	// todo
+	for _, key := range keysToLatch {
+		write, commitTs, err := mvccTxn.CurrentWrite(key)
+		if err != nil {
+			// 内部错误，不返回给客户端
+			return nil, err
+		}
 
-	return nil, nil
+		if write != nil {
+			if write.Kind == mvcc.WriteKindRollback {
+				continue
+			}
+
+			// key已提交
+			response.Error = &kvrpcpb.KeyError{Abort: fmt.Sprintf("key(%s) has already commited(commitTs=%v)", string(key), commitTs)}
+			return response, nil
+		}
+
+		lock, err := mvccTxn.GetLock(key)
+		if err != nil {
+			// 内部错误，不返回给客户端
+			return nil, err
+		}
+
+		if lock == nil {
+			// 锁不存在时也要写入rollback标记
+			mvccTxn.PutWrite(key, req.StartVersion, &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    mvcc.WriteKindRollback,
+			})
+		} else if lock.Ts == req.StartVersion {
+			mvccTxn.DeleteLock(key)
+			if lock.Kind == mvcc.WriteKindPut {
+				mvccTxn.DeleteValue(key)
+			}
+			mvccTxn.PutWrite(key, req.StartVersion, &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    mvcc.WriteKindRollback,
+			})
+		} else {
+			// key上存在其他事务的锁时也要写入rollback标记
+			if lock.Kind == mvcc.WriteKindPut {
+				mvccTxn.DeleteValue(key)
+			}
+			mvccTxn.PutWrite(key, req.StartVersion, &mvcc.Write{
+				StartTS: req.StartVersion,
+				Kind:    mvcc.WriteKindRollback,
+			})
+		}
+	}
+
+	if len(mvccTxn.Writes()) > 0 {
+		err = server.storage.Write(req.Context, mvccTxn.Writes())
+		if err != nil {
+			response.RegionError = util.RaftstoreErrToPbError(err)
+		}
+	}
+
+	return response, nil
 }
 
 func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	response := &kvrpcpb.ResolveLockResponse{}
+
+	// 获取所有锁住的key
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		response.RegionError = util.RaftstoreErrToPbError(err)
+		return response, nil
+	}
+	iter := reader.IterCF(engine_util.CfLock)
+
+	keys := [][]byte{}
+	for ; iter.Valid(); iter.Next() {
+		item := iter.Item()
+		val, err := item.Value()
+		if err != nil {
+			iter.Close()
+			reader.Close()
+			return nil, err
+		}
+		lock, err := mvcc.ParseLock(val)
+		if err != nil {
+			iter.Close()
+			reader.Close()
+			return nil, err
+		}
+		if lock.Ts == req.StartVersion {
+			keys = append(keys, item.Key())
+		}
+	}
+	iter.Close()
+	reader.Close()
+
+	if req.CommitVersion == 0 {
+		bResponse, err := server.KvBatchRollback(nil, &kvrpcpb.BatchRollbackRequest{
+			Context:      req.Context,
+			StartVersion: req.StartVersion,
+			Keys:         keys,
+		})
+
+		if err != nil {
+			return nil, err
+		}
+		response.Error = bResponse.Error
+		response.RegionError = bResponse.RegionError
+	} else {
+		cResponse, err := server.KvCommit(nil, &kvrpcpb.CommitRequest{
+			Context:       req.Context,
+			StartVersion:  req.StartVersion,
+			Keys:          keys,
+			CommitVersion: req.CommitVersion,
+		})
+		if err != nil {
+			return nil, err
+		}
+		response.Error = cResponse.Error
+		response.RegionError = cResponse.RegionError
+	}
+
+	return response, nil
 }
 
 // SQL push down commands.
